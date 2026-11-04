@@ -96,11 +96,6 @@ flowchart LR
     CF -->|"3 IP allowlist, managed + rate rules"| ALB
     AGT -->|"1a DC breakout IP<br/>(+ workload cert)"| R53
     ALB -->|"4 forward (after mTLS, if adopted)"| ECS
-
-    %% ---------- Operator flow ----------
-    OPS <-->|"A2/A3 SAML sign-in + CA-GW-05"| ENTRA
-    OPS -->|"A2/A3 portal, console, aws sso login"| IDC
-    IDC -->|"A2/A3 temporary role credentials"| IAM
     ECS <-->|"5 auth, budget, TPM/RPM check"| REDIS
     ECS <-->|"5 key / team / budget lookup"| AUR
     ECS -->|"6 guardrail pre-call (in VPC)"| GRD
@@ -122,6 +117,11 @@ flowchart LR
     ECS -.->|"secrets at task start"| SM
     SM -.-> KMS
     ECS -.->|"image pull"| ECR
+
+    %% ---------- Operator flow ----------
+    OPS <-->|"A2/A3 SAML sign-in + CA-GW-05"| ENTRA
+    OPS -->|"A2/A3 portal, console, aws sso login"| IDC
+    IDC -->|"A2/A3 temporary role credentials"| IAM
 ```
 
 > **Diagram conventions** (matching the AWS guidance style): solid arrows show the request path with numbered steps, and dotted arrows show supporting, asynchronous, or batch flows. **L-steps** are the login flow ([§2.2](01-common-design.md#22-common-login-flow-sequence)), **numbered steps** are the API request flow ([§4.3](#43-request-flow-walkthrough-aws)), and **A2/A3** are the operator scenarios ([§2.9](01-common-design.md#29-access-scenarios-and-checkpoints)). Items in parentheses, such as the Intune certificate, apply only if mTLS is adopted.

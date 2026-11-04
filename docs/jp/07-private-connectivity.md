@@ -1,20 +1,32 @@
-# 8. ステップ 4: 閉域接続（専用線）オプション
+# 8. ステップ 4: 閉域接続（任意の経路 A）
 
-**提案内容:** 経営層は、ゲートウェイと AI エージェントのトラフィックを、他の社内トラフィックと同じく既設の ExpressRoute、Direct Connect、Cloud Interconnect 回線に載せることを求めている。これは、サイト間 VPN、mTLS、Intune デバイス ID で保護したインターネット経由のアクセスを置き換えるものである。
+**提案内容:** ゲートウェイと AI エージェントのトラフィックを、他の社内トラフィックと同じく既設の ExpressRoute、Direct Connect、Cloud Interconnect 回線に載せる。これは [§2.6](01-common-design.md#26-接続経路モデル全設計に適用) の **経路 A** にあたる。
 
-**結論:** 実施すべきだが、**置き換えではなく追加の層として** 実施する。専用線をオンプレミスのユーザーとエージェントの *既定の経路* とし、可能な範囲でゲートウェイを *内部専用* にする。ステップ 2 の設計にある ID、デバイス、暗号化の制御はすべて維持する。
+**結論: 任意とする。** 主経路は経路 B（インターネット + オフィス/DC の IP 許可リスト + Entra、推奨オプションとして mTLS）である。利用者は全員社内ネットワーク上にいるため [A-13]、経路 A で全員をまかなうことも *できる*。しかし経路 A は ID、デバイス、暗号化の保護を何も加えず、通信事業者との契約、回線帯域、DC のルーティング、DNS フォワーディングに依存する。§8.0 の契機がある場合にのみ構築し、経路 B の ID、デバイス、暗号化の制御はすべて維持する。
+
+## 8.0 経路 A を採用すべき場合
+
+| 契機 | 経路 A が役立つ理由 |
+|---|---|
+| オフィスのプロキシで `llm.corp.example` を TLS インスペクションの対象外に **できない** [A-15] | インスペクションはノート PC の TLS 接続を置き換えるため、経路 B の mTLS を壊し、プロキシがプロンプトとキーを読めるようになる。閉域経路はプロキシを通らない。 |
+| 社内システムのインターネット公開エンドポイントがポリシーで禁止されている | 経路 A に必要なのは内部ロード バランサーだけである。 |
+| 送信ファイアウォールが固定の宛先 IP しか許可できず、Global Accelerator も受け入れられない（AWS） | 閉域経路では VPC のアドレス範囲全体を許可できる。Azure と GCP のフロントエンドはすでに固定 IP である（[§2.6](01-common-design.md#26-接続経路モデル全設計に適用)）。 |
+| インターネット ブレイクアウトの容量や信頼性に問題がある | ゲートウェイの通信がブレイクアウトを通らない。サインインは引き続きインターネットを使う（[§8.5](#85-閉域接続で解決-できない-こと全クラウド共通)）。 |
+| DC のワークロードにインターネットを使わせてはならない | エージェントは閉域で内部ロード バランサーに接続する。 |
+
+経路 A を採用する前に、回線帯域と契約条件をプロバイダーに確認すること。LLM の通信量は少ないが、長時間のストリーミング接続が多数発生する（[§8.9](#89-閉域接続のコスト日本)）。
 
 ## 8.1 全設計に共通する変更点
 
-| 要素 | ステップ 2 のベースライン（インターネット ゼロトラスト） | ステップ 4 の閉域オプション |
+| 要素 | 経路 B（主経路、インターネット ゼロトラスト） | 経路 A（任意、専用線） |
 |---|---|---|
-| ゲートウェイの受信 | パブリック LB + WAF + mTLS、および VPN 経由のプライベート フロントエンド | **内部 LB のみ**（内部 ALB / App Gateway のプライベート フロントエンド / リージョン内部 ALB）。パブリック リスナーは削除するか、リモート ワーカー向け ZTNA コネクタ用にのみ残す。 |
-| オンプレミス → クラウドの経路 | インターネット経由のサイト間 IPsec VPN | DX / ER / Interconnect の閉域ルーティング（BGP）。任意で **MACsec** または **回線上の IPsec** を追加 |
+| ゲートウェイの受信 | インターネット向け LB + WAF（採用する場合は + mTLS）。オフィス/DC の送信元 IP からのみ到達可能 | **内部 LB**（内部 ALB / App Gateway のプライベート フロントエンド / リージョン内部 ALB）。経路 B の LB と並行して運用するか、ポリシーで必要な場合は置き換える。 |
+| オンプレミス → クラウドの経路 | オフィス/DC のインターネット ブレイクアウト。VPN なし | DX / ER / Interconnect の閉域ルーティング（BGP）。任意で **MACsec** または **回線上の IPsec** を追加 |
 | DNS | `llm.corp.example` のパブリック DNS | スプリット ホライズン: オンプレミスのリゾルバーが `llm.corp.example` とクラウドの Private Link ゾーンをクラウドの受信リゾルバーにフォワードする |
 | モデル エンドポイント | ゲートウェイ VPC からのプライベート エンドポイント（すでに閉域） | 変更なし。ゲートウェイは引き続き PrivateLink、プライベート エンドポイント、PSC 経由でモデルを呼び出す。オンプレミスのクライアントはモデルを直接呼び出さないため、すべての利用が計量される。 |
 | Entra / Okta / Intune | インターネット（SaaS） | **引き続きインターネット（SaaS）。** 変更なし。8.5 を参照。 |
 | 外部モデル プロバイダー | 所在ルールにより禁止 [A-7] | 引き続き禁止。他クラウドの **日本リージョン** のモデル（例: AWS 東京から呼び出す Azure OpenAI Japan East）には、東京のコロケーション施設の自社ルーターを経由して **閉域網で** 接続するため、経路は日本国内に留まる。 |
-| リモート ワーカー | インターネット → パブリックの WAF/mTLS エッジ | ZTNA（Entra Private Access）または社内 VPN → DC → 専用線。8.6 を参照。 |
+| リモート ワーカー | このフェーズの対象外 [A-13] | このフェーズの対象外 [A-13]。将来の選択肢は 8.6 を参照。 |
 
 ## 8.2 AWS: Direct Connect オーバーレイ
 
@@ -40,7 +52,7 @@ flowchart LR
         TGW["Transit Gateway"]
         subgraph VPC["llm-gateway-prod VPC（パブリック サブネットなし）"]
             R53IN["Route 53 Resolver<br/>受信エンドポイント"]
-            IALB["内部 ALB<br/>リージョン WAF + mTLS 検証"]
+            IALB["内部 ALB<br/>リージョン WAF（+ mTLS 検証）"]
             ECS["ECS Fargate 上の LiteLLM"]
             VPCE["VPC エンドポイント<br/>bedrock-runtime など"]
         end
@@ -54,14 +66,14 @@ flowchart LR
     end
 
     XC["他クラウドの日本リージョン<br/>（例: ER プライベート ピアリング経由の<br/>Azure OpenAI Japan East）"]
-    REM["リモート ワーカー<br/>（自宅 / 出張先）"]
+    REM["リモート ワーカー<br/>（対象外、将来）"]
     ZTNA["Entra Private Access コネクタ<br/>（ゲートウェイ VPC 内の EC2）または<br/>DC への社内 VPN"]
 
     UOP -->|"P1 名前解決"| ODNS
     ODNS -->|"P2 フォワード"| DXC
     DXC --> DXGW --> TGW
     TGW -->|"P2"| R53IN
-    UOP -->|"P3 DX 上で HTTPS + mTLS"| CER
+    UOP -->|"P3 DX 上で HTTPS（+ mTLS）"| CER
     AGOP -->|"P3"| CER
     CER --> DXC
     TGW -->|"P4"| IALB --> ECS
@@ -84,7 +96,7 @@ flowchart LR
 | DX が保護するもの / しないもの | DX はインターネットにルーティングされない閉域回線である。既定ではトラフィックを **暗号化せず**、ユーザーやデバイスを **認証しない**。暗号化の選択肢は、[専用接続での MACsec](https://docs.aws.amazon.com/directconnect/latest/UserGuide/MACsec.html)（対応拠点で 10/100/400 Gbps）または TGW で終端する [Direct Connect 上の Private IP VPN](https://docs.aws.amazon.com/vpn/latest/s2svpn/private-ip-dx.html) である。いずれにしても TLS 1.2 以上と mTLS をエンドツーエンドで維持する。 |
 | PaaS/モデル エンドポイントへの閉域ルーティング | DX トランジット VIF → DX Gateway → TGW → ゲートウェイ VPC。Bedrock には **LiteLLM** だけが [インターフェイス VPC エンドポイント](https://docs.aws.amazon.com/bedrock/latest/userguide/vpc-interface-endpoints.html) 経由でアクセスする。オンプレミスのクライアントは Bedrock の DNS を必要としない。オンプレミスの DNS は `llm.corp.example`（Route 53 プライベート ホストゾーン）を [Route 53 Resolver の受信エンドポイント](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/resolver-forwarding-inbound-queries.html) にフォワードする。**パブリック VIF** は避ける。AWS のパブリック エンドポイントに到達できるが、VPC エンドポイント ポリシーを迂回してしまう。 |
 | 引き続きインターネットを使うトラフィック | (a) ユーザーのデバイスから社内インターネット出口を経由する、Entra ID、Okta へのサインインと MFA、Okta Verify のプッシュ。(b) Network Firewall を経由する LiteLLM → Entra のトークン エンドポイント、JWKS、Graph。**モデルのトラフィックはない**。公開モデル API は禁止しており [A-7]、クラウド間の日本リージョンのバックエンド（P7）は DX → コロケーションのルーター → 他クラウドのプライベート ピアリングを通る。 |
-| リモート / ハイブリッド ワーカー | DX の経路上にはいない。選択肢は、VPC 内にコネクタを置く **Entra Private Access**（アプリごとに CA + 準拠デバイス）、既存の社内 VPN で DC に入ってから DX を通る方式（折り返しによるレイテンシ）、またはリモート ユーザー専用にステップ 2 のパブリック mTLS エッジを残す方式である。Entra SAML 付きの [AWS Client VPN](https://docs.aws.amazon.com/vpn/latest/clientvpn-admin/what-is.html) も使えるが、Intune コンプライアンスは評価しない。 |
+| リモート / ハイブリッド ワーカー | このフェーズの対象外 [A-13]。後で追加する場合、DX の経路上にはいない。選択肢は、VPC 内にコネクタを置く **Entra Private Access**（アプリごとに CA + 準拠デバイス）、既存の社内 VPN で DC に入ってから DX を通る方式（折り返しによるレイテンシ）、またはリモート ユーザー向けに経路 B のパブリック mTLS エッジを残し、そのユーザーには IP 許可リストを外す方式である。Entra SAML 付きの [AWS Client VPN](https://docs.aws.amazon.com/vpn/latest/clientvpn-admin/what-is.html) も使えるが、Intune コンプライアンスは評価しない。 |
 | 帯域、レイテンシ、冗長性、コスト | LLM トラフィックは低帯域（テキスト）だが、長時間のストリーミング接続が多い。モデルの推論時間（秒単位）が支配的で、DX のレイテンシ上の利点（ミリ秒単位）は相対的に小さい。99.99% には **東京と大阪** の DX ロケーションによる [最大回復性モデル](https://docs.aws.amazon.com/directconnect/latest/UserGuide/resiliency_toolkit.html)（2 拠点 × 2 接続）を使う。これで物理経路もすべて日本国内に留まる。回線が既設なら追加費用は小さい。DX のデータ送信料（東京／大阪から日本のロケーションへ USD 0.041/GB）、TGW のアタッチメントと処理料、Resolver エンドポイント、更新する場合は MACsec 対応ポートである。詳細な内訳: [§8.9](#89-閉域接続のコスト日本)。 |
 | 運用の複雑さ / 障害パターン | BGP の経路撤回や経路漏洩、DX と VPN バックアップ間の非対称ルーティング、**DNS フォワーディングの障害**（クライアントがパブリック DNS にフォールバックしてクローズド フェイルする。これは望ましい挙動）、DX 上の IPsec での MTU 問題、ゲートウェイを他のスポークに公開してしまう TGW ルート テーブルの誤り、MACsec キー（CKN/CAK）のローテーション。DX の CloudWatch メトリクス、TGW フロー ログ、オンプレミスからの合成監視で監視する。 |
 
@@ -114,7 +126,7 @@ flowchart LR
             DNSR["DNS Private Resolver<br/>（受信エンドポイント）"]
         end
         subgraph SPOKE["llm-gateway スポーク"]
-            AGW["App Gateway WAF v2<br/>プライベート フロントエンドのみ + mTLS"]
+            AGW["App Gateway WAF v2<br/>プライベート フロントエンドのみ（+ mTLS）"]
             ACA["Container Apps（内部）上の LiteLLM"]
             PE["プライベート エンドポイント<br/>Azure OpenAI、Content Safety、KV など"]
         end
@@ -127,12 +139,12 @@ flowchart LR
     end
 
     XC["他クラウドの日本リージョン<br/>（例: DX 経由の Bedrock jp.）"]
-    REM["リモート ワーカー"]
+    REM["リモート ワーカー<br/>（対象外、将来）"]
     GSA["Entra Private Access<br/>（Global Secure Access クライアント<br/>+ スポーク内のコネクタ）"]
 
     UOP -->|"P1 名前解決"| ODNS -->|"P2"| ERC
     ERC --> ERGW -->|"P2"| DNSR
-    UOP -->|"P3 HTTPS + mTLS"| CER
+    UOP -->|"P3 HTTPS（+ mTLS）"| CER
     AGOP -->|"P3"| CER
     CER --> ERC
     ERGW -->|"P4（検査する場合はハブ FW 経由）"| AFW --> AGW --> ACA
@@ -154,7 +166,7 @@ flowchart LR
 | ER が保護するもの / しないもの | ER プライベート ピアリングは接続プロバイダーを経由する閉域の L3 接続である。既定では **暗号化されず**、ユーザーやデバイスも識別しない。暗号化の選択肢は、[ExpressRoute Direct での MACsec](https://learn.microsoft.com/azure/expressroute/expressroute-howto-macsec)（ポート ペアのみ。プロバイダー回線は対象外）または [ExpressRoute プライベート ピアリング上のサイト間 VPN](https://learn.microsoft.com/azure/vpn-gateway/site-to-site-vpn-private-peering) である。 |
 | PaaS/モデル エンドポイントへの閉域ルーティング | **プライベート ピアリング上のプライベート エンドポイント** を使う。PaaS のパブリック エンドポイントへの到達に Microsoft ピアリングは使わない。ルーティングが複雑になり、プライベート エンドポイントの制御を迂回するためである。オンプレミスの DNS は、使用するすべての `privatelink.*` ゾーンを **DNS Private Resolver の受信エンドポイント** に条件付きフォワードする必要がある（[プライベート エンドポイントのオンプレミス DNS](https://learn.microsoft.com/azure/private-link/private-endpoint-dns-integration)）。ゾーンの漏れが最もよくある障害である。 |
 | 引き続きインターネットを使うトラフィック | デバイスからの Entra ID、Okta、Intune へのサインインとチェックイン。Microsoft は M365 と Entra のトラフィックの大半にインターネットを推奨しており、M365 向けの ER Microsoft ピアリングには承認が必要である（[Microsoft 365 向け ExpressRoute](https://learn.microsoft.com/microsoft-365/enterprise/azure-expressroute)）。LiteLLM → Entra のトークンと Graph の通信は Azure Firewall を経由する。モデルのトラフィックはインターネットを使わない [A-7]。 |
-| リモート / ハイブリッド ワーカー | **Entra Private Access**（Global Secure Access クライアント）が最も自然な選択である。同じ CA ポリシーで準拠デバイスを必須にでき、コネクタはスポーク内に置いて App Gateway のプライベート フロントエンドを対象にする。DC への折り返しは不要。代替は、Entra 認証付きの Azure VPN Gateway P2S または社内 VPN である。 |
+| リモート / ハイブリッド ワーカー | このフェーズの対象外 [A-13]。後で追加する場合は **Entra Private Access**（Global Secure Access クライアント）が最も自然な選択である。同じ CA ポリシーで準拠デバイスを必須にでき、コネクタはスポーク内に置いて App Gateway のプライベート フロントエンドを対象にする。DC への折り返しは不要。代替は、Entra 認証付きの Azure VPN Gateway P2S または社内 VPN である。 |
 | 帯域、レイテンシ、冗長性、コスト | **ER ゲートウェイの SKU** は総スループットとフロー数で選ぶ。長時間の SSE ストリームが多いと接続数の上限を消費する。[FastPath](https://learn.microsoft.com/azure/expressroute/about-fastpath) はデータ経路でゲートウェイをバイパスするが、Private Link との組み合わせの制限を確認すること。冗長性には **東京と大阪** の 2 つのピアリング拠点に 2 回線を使う（[ER の回復性設計](https://learn.microsoft.com/azure/expressroute/design-architecture-for-resiliency)）。**Standard** 回線が到達するのは、日本の地政学的リージョン内の Azure リージョン（Japan East と Japan West）だけである。Premium アドオンは購入しない。コストが増えるうえ、日本国外のリージョンへの経路が開くためである（[ロケーション](https://learn.microsoft.com/azure/expressroute/expressroute-locations-providers)）。コストは、回線（Local / 従量制 / 無制限）、ゲートウェイの時間課金、プライベート エンドポイントの GB 単位課金、ハブで検査する場合はファイアウォールの処理料である。詳細な内訳: [§8.9](#89-閉域接続のコスト日本)。 |
 | 運用の複雑さ / 障害パターン | プライベート DNS ゾーンの乱立と構成ずれ。ハブのファイアウォール検査を追加したときの非対称ルーティング（UDR で双方向をカバーする必要がある）。ER 回線のメンテナンス時間帯。ゲートウェイ SKU の飽和。Key Vault での MACsec CAK/CKN のローテーション。BGP コミュニティやルート フィルターの誤り。Connection Monitor、ER のメトリクス、Sentinel 上の Firewall ログで監視する。 |
 
@@ -185,7 +197,7 @@ flowchart LR
             NAT["Cloud NGFW + Cloud NAT"]
         end
         subgraph SVCP["llm-gateway サービス プロジェクト（VPC-SC）"]
-            ILB["リージョン内部 ALB<br/>Cloud Armor + mTLS"]
+            ILB["リージョン内部 ALB<br/>Cloud Armor（+ mTLS）"]
             RUN["Cloud Run 上の LiteLLM"]
         end
         VTX["Vertex AI / Model Armor<br/>（asia-northeast1 エンドポイント）"]
@@ -197,12 +209,12 @@ flowchart LR
     end
 
     XC["他クラウドの日本リージョン<br/>（Bedrock jp. / Azure OpenAI Japan East）"]
-    REM["リモート ワーカー"]
+    REM["リモート ワーカー<br/>（対象外、将来）"]
     ZT["Entra Private Access コネクタ<br/>（ホスト VPC 内の GCE）または社内 VPN"]
 
     UOP -->|"P1 名前解決"| ODNS -->|"P2"| VLAN
     VLAN --> CR -->|"P2"| DNSIN
-    UOP -->|"P3 HTTPS + mTLS"| CER
+    UOP -->|"P3 HTTPS（+ mTLS）"| CER
     AGOP -->|"P3"| CER
     CER --> VLAN
     CR -->|"P4"| ILB --> RUN
@@ -224,7 +236,7 @@ flowchart LR
 | Interconnect が保護するもの / しないもの | Dedicated Interconnect と Partner Interconnect は、VPC への閉域の L2/L3 接続を提供する。既定では **暗号化されず**、ユーザーやデバイスの ID も持たない。暗号化の選択肢は、[Cloud Interconnect 用 MACsec](https://cloud.google.com/network-connectivity/docs/interconnect/concepts/macsec-overview) または [Cloud Interconnect 上の HA VPN](https://cloud.google.com/network-connectivity/docs/interconnect/concepts/ha-vpn-interconnect)（IPsec）である。 |
 | PaaS/モデル エンドポイントへの閉域ルーティング | オンプレミスのクライアントが到達するのは **内部 ALB** だけである。LiteLLM は **Google API 用 PSC** 経由で Vertex AI と Model Armor にアクセスする。Cloud Router では内部 LB のサブネットを **カスタム広報** する必要がある。オンプレミスのツールが Google API を直接呼び出す場合は PSC の IP も広報する。オンプレミスの DNS は **Cloud DNS の受信サーバー ポリシー** にフォワードする（[オンプレミスからの Vertex PSC](https://cloud.google.com/vertex-ai/docs/general/vertex-psc-gen-ai)、[オンプレミス向けの限定公開の Google アクセス](https://cloud.google.com/vpc/docs/configure-private-google-access-hybrid)）。オンプレミスのツールが Vertex を直接呼び出す場合は、VPC-SC の上り（ingress）ルールでオンプレミスのアクセスレベルを許可する必要がある。トラフィックが常に LiteLLM を経由するなら不要である。 |
 | 引き続きインターネットを使うトラフィック | Entra、Okta、Intune（デバイス ↔ SaaS）。Cloud NGFW の FQDN ルールと Cloud NAT の静的 IP を経由する LiteLLM → Entra と Graph。モデルのトラフィックはない [A-7]。 |
-| リモート / ハイブリッド ワーカー | ホスト VPC の GCE に置く Entra Private Access コネクタ（CA + 準拠デバイス）、社内 VPN、または Intune シグナルを使う **UI 専用** アクセスとしての Chrome Enterprise Premium + IAP。 |
+| リモート / ハイブリッド ワーカー | このフェーズの対象外 [A-13]。後で追加する場合は、ホスト VPC の GCE に置く Entra Private Access コネクタ（CA + 準拠デバイス）、社内 VPN、または Intune シグナルを使う **UI 専用** アクセスとしての Chrome Enterprise Premium + IAP。 |
 | 帯域、レイテンシ、冗長性、コスト | [99.99% 構成](https://cloud.google.com/network-connectivity/docs/interconnect/tutorials/dedicated-creating-9999-availability)（4 接続、2 メトロ、2 つの Cloud Router）を使い、2 つのメトロは **東京と大阪** にする。VLAN アタッチメントの容量と Cloud Router の経路数の上限に注意する。Interconnect 経由の送信（アジア → アジアで USD 0.042/GiB）はインターネット送信より安いが、LLM のトラフィック量は小さいため、アタッチメントとポートの固定費が支配的になる。詳細な内訳: [§8.9](#89-閉域接続のコスト日本)。 |
 | 運用の複雑さ / 障害パターン | カスタム経路広報の漏れ（最もよくある問題）。オンプレミスと Cloud DNS 間の DNS フォワーディングのループ。403 に見える VPC-SC の拒否。MACsec キーのローテーション。Partner Interconnect のプロバイダー障害。Interconnect のメトリクス、Network Intelligence Center の接続テスト、VPC-SC のドライラン ログで監視する。 |
 
@@ -265,13 +277,17 @@ flowchart TB
 
 ## 8.6 リモート ワーカーとハイブリッド ワーカー
 
+**このフェーズの対象外 [A-13]。** 本節はリモート アクセスを追加するときのために残している。その場合、経路 B のオフィス/DC の IP 許可リストは次のいずれかに置き換える必要がある。
+
 | 選択肢 | デバイス信頼 | ユーザー体験 | 推奨 |
 |---|---|---|---|
 | 各クラウドの VPC/VNet にコネクタを置く **Entra Private Access**（Global Secure Access） | アプリ セグメントごとの Entra CA + Intune コンプライアンス（[Private Access](https://learn.microsoft.com/entra/global-secure-access/concept-private-access)） | 透過的、アプリ単位、フル トンネルなし | **推奨**: どこでも同じポリシー エンジンを使え、3 クラウドすべてで機能する |
 | 社内のフル トンネル VPN → DC → 専用線 | VPN のポスチャ チェック（ベンダー依存） | 折り返しによるレイテンシと VPN 容量の計画が必要 | 短期的には許容 |
-| リモート ユーザー専用にステップ 2 のパブリック エッジ（WAF + mTLS + CA）を残す | エッジでの Intune デバイス証明書 + CA | 直接接続でレイテンシが最も低い | 許容。リモート ユーザー向けに意図的に残す「インターネット ゼロトラスト」経路である。 |
+| 経路 B のパブリック エッジ（WAF + mTLS + CA）を残し、IP 許可リストを外す | エッジでの Intune デバイス証明書 + CA | 直接接続でレイテンシが最も低い | 許容。ただし **mTLS は必須になる**。許可リストがなければ、コピーされた仮想キーを止める確認は mTLS だけだからである（[§2.3.2](01-common-design.md#232-ロード-バランサーで-mtls-が確認すること)）。 |
 
 ## 8.7 mTLS の解説
+
+Intune 証明書による mTLS は、どの設計でも推奨オプションであり、[§2.3.2](01-common-design.md#232-ロード-バランサーで-mtls-が確認すること) に挙げた場合は必須である。この節では、mTLS が守るものと守らないものを説明する。
 
 **仕組み（TLS 1.3、簡略版）:**
 
@@ -288,7 +304,7 @@ sequenceDiagram
     S->>S: トラスト ストアへのチェーン、有効期間、EKU、失効（CRL/OCSP）を検証
     S-->>C: Finished（セッション鍵の確立）
     C->>S: HTTP リクエスト + Authorization: Bearer（Entra JWT / 仮想キー）
-    S->>S: 証明書の識別情報ヘッダーを LiteLLM へ転送（例: デバイス ID / サブジェクト）
+    S->>S: 証明書ヘッダーを LiteLLM へ転送（シリアル番号を記録。ユーザー照合はしない、§2.3.3）
 ```
 
 | | mTLS が保護するもの | mTLS が保護 **しない** もの / 制限 |
@@ -297,7 +313,7 @@ sequenceDiagram
 | **暗号化** | クライアントと TLS 終端点の間の転送中の機密性と完全性、前方秘匿性（TLS 1.3） | 保護されるのは **終端点**（LB）までである。LB → バックエンドの区間には別途 TLS が必要。社内の **TLS 検査プロキシ** は mTLS を壊すため、`llm.corp.example` を検査対象から除外する。 |
 | **証明書のライフサイクル** | 自動化できる: デバイスには Intune の SCEP/PKCS プロファイル、ワークロードには Private CA / Key Vault / CAS | 発行、更新、CA のローテーションは運用作業になる。期限切れの証明書は障害の原因になるため、有効期限を監視し、自動更新付きで 30〜90 日の有効期間にする。 |
 | **失効** | 対応していればエッジで CRL/OCSP をチェックする（ALB は CRL に対応。App Gateway と Google LB の対応状況はリージョンごとに確認） | 失効は反映が遅いか、対応していないことが多い。CRL より短命な証明書のほうが確実である。Intune でコンプライアンスを失っても、自動化しない限り証明書は自動的に失効しない。 |
-| **鍵の保護** | TPM や Secure Enclave に結び付いたエクスポート不可の鍵（Intune で TPM KSP を必須にできる） | ソフトウェアに保存された鍵は、管理外のマシンにコピーされうる。 |
+| **鍵の保護** | TPM や Secure Enclave に結び付いたエクスポート不可の鍵。Intune 証明書プロファイルで設定する（Intune で TPM KSP を必須にできる） | ソフトウェアに保存された鍵やエクスポート可能な鍵は、仮想キーと一緒に管理外のマシンにコピーされうる。鍵をファイルでしか読まない CLI（Claude Code）や証明書オプションのない CLI（Codex CLI）で鍵をエクスポート不可に保つには、ローカルの mTLS ヘルパーが必要である（[§2.3.4](01-common-design.md#234-コーディング-エージェントのクライアント)）。 |
 | **ヘッダーの信頼** | エッジが証明書の属性を LiteLLM に渡す | バックエンドはこれらのヘッダーを LB からのもの **だけ** 受け入れる必要がある。クライアントが送ってきた同名ヘッダーは除去する。 |
 
 **mTLS と専用線の比較:**
@@ -319,20 +335,21 @@ sequenceDiagram
 
 | 層 | 制御（全クラウド共通） |
 |---|---|
-| **ユーザー ID** | UI と API には Entra ID の OIDC/JWT。MFA には **EAM** 経由の Okta Verify（管理者はフィッシング耐性のある方式）。短いトークン有効期間。SCIM によるプロビジョニング解除。 |
-| **デバイス** | トークン発行時の **条件付きアクセス** による Intune コンプライアンスの適用 **と**、ゲートウェイのエッジでの **mTLS** による、Intune 発行・TPM 結合の **デバイス証明書** の確認。 |
-| **ワークロード** | エージェントは Entra ワークロード ID（フェデレーション資格情報）と **mTLS ワークロード証明書** で認証する。サービス アカウント用の仮想キーは例外としてのみ使い、有効期限、予算、IP 制限を付ける。 |
-| **ネットワーク** | オンプレミスのユーザーとエージェントから **内部専用** ゲートウェイへは **専用線を既定** とする。リモート ユーザーには **Entra Private Access**。パブリック エッジは削除するか、東京で終端する WAF + mTLS + CA 付きでのみ残す。モデルにはプライベート エンドポイント経由、または他クラウドの日本リージョンのモデルなら閉域網経由でのみアクセスする。送信は許可リスト化し、公開モデル API は含めない。 |
+| **ユーザー ID** | UI と API には Entra ID の OIDC/JWT。Claude Code と Codex CLI はトークン コマンドでトークンを取得する。MFA には **EAM** 経由の Okta Verify（管理者はフィッシング耐性のある方式）。短いトークン有効期間。SCIM によるプロビジョニング解除。仮想キーは貼り付けたキーしか受け付けないツールだけ。 |
+| **デバイス** | トークンの発行・更新のたびの **条件付きアクセス** による Intune コンプライアンスの適用。**推奨オプション**（[A-16] が成り立たない場合やリモート アクセスを追加する場合は必須）: ゲートウェイのエッジでの **mTLS** による、Intune 発行・TPM 結合の **デバイス証明書** の確認。 |
+| **運用者アクセス** | クラウド コントロール プレーン アプリへの CA-GW-05（フィッシング耐性のある MFA、準拠デバイス、オフィス/DC のネームド ロケーション）、クラウド IAM の送信元 IP 条件、1 時間の管理者セッション（[§2.9](01-common-design.md#29-アクセス-シナリオとチェックポイント)）。 |
+| **ワークロード** | エージェントは Entra ワークロード ID（フェデレーション資格情報）で認証し、mTLS を採用する場合は **mTLS ワークロード証明書** も使う。サービス アカウント用の仮想キーは例外としてのみ使い、有効期限、予算、IP 制限を付ける。 |
+| **ネットワーク** | **経路 B を既定とする:** オフィスと DC のクライアントは、当社の送信元 IP だけを受け入れる東京のロード バランサーに、WAF + Entra（採用する場合は + mTLS）を経て接続し、東京で終端する。**経路 A**（専用線経由の内部専用ロード バランサー）は §8.0 の契機がある場合にのみ追加する。CDN やグローバル エッジは置かない。モデルにはプライベート エンドポイント経由、または他クラウドの日本リージョンのモデルなら閉域網経由でのみアクセスする。送信は許可リスト化し、公開モデル API は含めない。 |
 | **転送の暗号化** | LB → LiteLLM → モデルを含め、エンドツーエンドで TLS 1.2 以上（1.3 を推奨）。データ分類でリンク層の暗号化が必要なら、**回線上の MACsec または IPsec**。 |
 | **認可と利用量** | 組織、チーム、ユーザー、キーごとの LiteLLM の RBAC、モデル アクセス グループ、予算、TPM/RPM。外側の上限としてクラウドのクォータ。 |
 | **データ** | すべてのリクエストに日本国内で処理されるガードレール（PII、プロンプト インジェクション）。既定はメタデータのみのログ記録。CMK による暗号化。不変の監査ログ。保存先、バックアップ、エクスポートはすべて東京か大阪に置く（[§2.5](01-common-design.md#25-日本国内データ所在全設計に適用)）。 |
 | **検知と対応** | Entra のサインイン ログ、WAF、ファイアウォール、LiteLLM の監査と利用額の異常を Sentinel または SIEM で監視する。ユーザーのオフボーディング時やデバイスの非準拠時にキーを自動で失効させる。 |
 
-> **経営層への結論:** ゲートウェイのトラフィックを ExpressRoute、Direct Connect、Interconnect 経由にすることは、露出の削減と予測可能な接続性の点で良い選択である。ただし、ユーザー MFA、デバイス コンプライアンス、mTLS、暗号化の代わりには **ならない**。閉域経路の設計は、ID、デバイス、mTLS の制御の代わりとしてではなく、それらと一緒に承認すること。
+> **経営層への結論:** ゲートウェイのセキュリティは、ユーザー MFA、デバイス コンプライアンス、IP 許可リスト、採用する場合は mTLS から生まれ、これらはどちらの経路でも同じである。ExpressRoute、Direct Connect、Interconnect 経由にするとインターネットへの露出は減るが、契約、帯域、運用の依存関係が増え、これらの制御の代わりには **ならない**。まずインターネット経路で始め、特定の契機が必要とする場合に閉域経路を追加する。
 
 ## 8.9 閉域接続のコスト（日本）
 
-各ベンダーの料金ページに掲載された USD の定価で、2026-10-30 に確認した。当社の契約価格、通貨、税金によって実際の金額は異なる。回線は既設 [A-8] なので、ポートと回線の料金はほぼ **埋没費用** である。ゲートウェイによって増えるのは、GB 単位の転送料、アタッチメントとゲートウェイの料金、そしてチャージバックすると決めた場合の固定費の負担分である。
+以下のコストは、経路 A を採用する場合か、他クラウドの日本リージョン バックエンドが専用線を使う場合にのみ発生する。各ベンダーの料金ページに掲載された USD の定価で、2026-10-30 に確認した。当社の契約価格、通貨、税金によって実際の金額は異なる。回線は既設 [A-8] なので、ポートと回線の料金はほぼ **埋没費用** である。ゲートウェイによって増えるのは、GB 単位の転送料、アタッチメントとゲートウェイの料金、そしてチャージバックすると決めた場合の固定費の負担分である。
 
 | コスト要素 | AWS Direct Connect | Azure ExpressRoute | GCP Cloud Interconnect |
 |---|---|---|---|
