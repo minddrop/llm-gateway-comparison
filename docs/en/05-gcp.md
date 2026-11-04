@@ -2,7 +2,7 @@
 
 > **Naming note:** Google's documentation now presents Vertex AI's model and agent capabilities under the **Gemini Enterprise Agent Platform** name ([models overview](https://cloud.google.com/gemini-enterprise-agent-platform/models)). This document keeps the name "Vertex AI" because the API surface (`aiplatform.googleapis.com`) and LiteLLM's `vertex_ai/` provider prefix are unchanged. Re-check names and endpoints before implementation.
 
-**Baseline:** Google Cloud security foundations (Shared VPC, VPC Service Controls, Private Service Connect), with **LiteLLM on Cloud Run** behind a **Google Cloud Application Load Balancer with Cloud Armor and mTLS**. Apigee is optional ([§3.3](02-reference-architectures.md#33-google-cloud)). The primary region is **Tokyo (`asia-northeast1`)**, and the DR region for gateway infrastructure is **Osaka (`asia-northeast2`)**. Japan residency rules from [§2.5](01-common-design.md#25-japan-data-residency-applies-to-every-design) apply throughout. Step 4 ([§8.4](07-private-connectivity.md#84-gcp-cloud-interconnect-overlay)) adds the Cloud Interconnect overlay.
+**Baseline:** Google Cloud security foundations (Shared VPC, VPC Service Controls, Private Service Connect), with **LiteLLM on Cloud Run** behind a **regional external Application Load Balancer with Cloud Armor** (and mTLS as a recommended option). The gateway is exposed on **Route B** ([§2.6](01-common-design.md#26-ingress-model-applies-to-every-design)): Cloud Armor admits only our office and DC egress IPs, LiteLLM checks the Entra token, and the load balancer checks the Intune certificate if mTLS is adopted. **Route A** is optional and adds a regional internal Application LB over Cloud Interconnect. Apigee is optional ([§3.3](02-reference-architectures.md#33-google-cloud)). The primary region is **Tokyo (`asia-northeast1`)**, and the DR region for gateway infrastructure is **Osaka (`asia-northeast2`)**. Japan residency rules from [§2.5](01-common-design.md#25-japan-data-residency-applies-to-every-design) apply throughout. Step 4 ([§8.4](07-private-connectivity.md#84-gcp-cloud-interconnect-overlay)) describes the optional Cloud Interconnect route.
 
 ## 6.1 Architecture diagram (GCP)
 
@@ -10,7 +10,7 @@
 flowchart LR
     subgraph CLIENTS["Clients"]
         direction TB
-        U["Employee browser / IDE<br/>Intune-compliant device<br/>+ Intune device cert"]
+        U["Engineer laptop in the office<br/>browser / Claude Code / Codex CLI / IDE<br/>Intune-compliant<br/>(+ Intune cert, TPM key, if mTLS adopted)"]
         AGT["AI agents & internal apps<br/>(on-prem DC / other projects)"]
     end
 
@@ -23,7 +23,7 @@ flowchart LR
 
     subgraph HOST["Shared VPC host project: net-prod"]
         direction TB
-        CR["Cloud Router + HA VPN (baseline)<br/>/ Cloud Interconnect VLANs (Step 4)"]
+        CR["Cloud Router + Interconnect VLANs<br/>(Route A, optional;<br/>cross-cloud backends)"]
         DNS["Cloud DNS<br/>private zones + inbound server policy"]
         PSC["PSC endpoint for Google APIs<br/>(all-apis / vpc-sc bundle)"]
         NGFW["Cloud NGFW policy (FQDN egress rules)<br/>+ Cloud NAT (static IPs)"]
@@ -31,7 +31,7 @@ flowchart LR
 
     subgraph SVC["Service project: llm-gateway-prod (asia-northeast1 Tokyo, multi-zone) inside VPC-SC perimeter"]
         direction TB
-        LB["Application Load Balancer<br/>(regional external or regional internal,<br/>asia-northeast1)<br/>mTLS (TrustConfig: Intune CA)<br/>+ Cloud Armor (WAF, rate limit)"]
+        LB["Regional external Application LB<br/>(Route B: office/DC IPs only)<br/>+ regional internal LB (Route A, optional)<br/>mTLS (TrustConfig: Intune CA), recommended option<br/>+ Cloud Armor (IP allowlist, WAF, rate limit)"]
         RUN["Cloud Run service<br/>LiteLLM Proxy + UI<br/>internal ingress, min instances 3<br/>Direct VPC egress<br/>runtime SA (no keys)"]
         SQL[("Cloud SQL for PostgreSQL<br/>Enterprise Plus, regional HA<br/>private IP / PSC")]
         MEM[("Memorystore (Valkey / Redis)<br/>HA, private")]
@@ -62,10 +62,10 @@ flowchart LR
     ENTRA <-->|"L5 MFA via EAM"| OKTA
     RUN -->|"L6b token exchange, JWKS, Graph"| NGFW
 
-    U -->|"1 HTTPS + device cert"| LB
-    AGT -->|"1a HA VPN (baseline) / Interconnect (Step 4)"| CR
-    CR -->|"1a internal LB VIP"| LB
-    LB -->|"2-3 Cloud Armor + mTLS ok<br/>serverless NEG"| RUN
+    U -->|"1 HTTPS + Entra JWT or key<br/>(+ Intune cert)<br/>(office breakout IP)"| LB
+    AGT -->|"1a DC breakout IP + workload cert"| LB
+    CR -.->|"Route A (optional): internal LB VIP"| LB
+    LB -->|"2-3 Cloud Armor ok (+ mTLS)<br/>serverless NEG"| RUN
     RUN <-->|"4 budget / TPM-RPM counters"| MEM
     RUN <-->|"4 key / team lookup"| SQL
     RUN -->|"5 guardrail pre-call"| PSC
@@ -92,7 +92,7 @@ flowchart LR
 
 | # | GCP service | Purpose | AWS equivalent | Azure equivalent |
 |---|---|---|---|---|
-| 1 | [Cloud Load Balancing: Application LB](https://cloud.google.com/load-balancing/docs/application-load-balancer), **regional** external and regional internal modes only, with [mTLS](https://cloud.google.com/load-balancing/docs/mtls) (supported on all Application LB types) | L7 ingress in `asia-northeast1`, client-cert validation via TrustConfig (Intune CA) | ALB (mTLS) | App Gateway (mTLS) |
+| 1 | [Cloud Load Balancing: Application LB](https://cloud.google.com/load-balancing/docs/application-load-balancer), **regional** external and regional internal modes only, with [mTLS](https://cloud.google.com/load-balancing/docs/mtls) (supported on all Application LB types) | L7 ingress in `asia-northeast1`. Recommended option: client-cert validation via TrustConfig (Intune CA). | ALB (mTLS) | App Gateway (mTLS) |
 | 2 | [Cloud Armor](https://cloud.google.com/armor/docs/cloud-armor-overview) | WAF (preconfigured OWASP rules), rate limiting, geo/IP rules, Adaptive Protection | AWS WAF + Shield | App Gateway WAF |
 | 3 | [Cloud Run](https://cloud.google.com/run/docs/overview/what-is-cloud-run) ([ingress controls](https://cloud.google.com/run/docs/securing/ingress), [Direct VPC egress](https://cloud.google.com/run/docs/configuring/vpc-direct-vpc)). Alternative: [GKE Autopilot](https://cloud.google.com/kubernetes-engine/docs/concepts/autopilot-overview) | LiteLLM Proxy + UI | ECS Fargate / EKS | Container Apps / AKS |
 | 4 | [Cloud SQL for PostgreSQL](https://cloud.google.com/sql/docs/postgres) ([HA](https://cloud.google.com/sql/docs/postgres/high-availability)). Alternative: AlloyDB | LiteLLM DB | Aurora PostgreSQL | PostgreSQL Flexible Server |
@@ -101,7 +101,7 @@ flowchart LR
 | 7 | [Model Armor](https://cloud.google.com/model-armor/overview) in `asia-northeast1` ([locations](https://docs.cloud.google.com/model-armor/locations)) | Prompt-injection, jailbreak, sensitive data (SDP), and malicious-URL screening | In-VPC guardrail service | Content Safety / Prompt Shields |
 | 8 | [Private Service Connect for Google APIs](https://cloud.google.com/vpc/docs/private-service-connect) | Private VIP for `*.googleapis.com` (Vertex AI, Secret Manager, GCS, Logging) | VPC interface endpoints | Private Endpoints |
 | 9 | [VPC Service Controls](https://cloud.google.com/vpc-service-controls/docs/overview) | Data-exfiltration perimeter around the Vertex AI, GCS, BigQuery, Secret Manager, and Cloud SQL APIs | (SCPs + endpoint policies) | (Private endpoints + Azure Policy, NSP) |
-| 10 | [Shared VPC](https://cloud.google.com/vpc/docs/shared-vpc) + [Cloud Router](https://cloud.google.com/network-connectivity/docs/router/concepts/overview) + [HA VPN](https://cloud.google.com/network-connectivity/docs/vpn/concepts/overview) / [Cloud Interconnect](https://cloud.google.com/network-connectivity/docs/interconnect/concepts/overview) | Hybrid routing | TGW + VPN / DX | vWAN/hub + VPN/ER |
+| 10 | [Shared VPC](https://cloud.google.com/vpc/docs/shared-vpc) + [Cloud Router](https://cloud.google.com/network-connectivity/docs/router/concepts/overview) + [HA VPN](https://cloud.google.com/network-connectivity/docs/vpn/concepts/overview) / [Cloud Interconnect](https://cloud.google.com/network-connectivity/docs/interconnect/concepts/overview) | Hybrid routing, only for Route A and cross-cloud backends | TGW + VPN / DX | vWAN/hub + VPN/ER |
 | 11 | [Cloud DNS](https://cloud.google.com/dns/docs/overview) ([inbound server policy](https://cloud.google.com/dns/docs/server-policies-overview)) | On-premises resolution of private zones and PSC | Route 53 Resolver | DNS Private Resolver |
 | 12 | [Cloud NGFW](https://cloud.google.com/firewall/docs/about-firewalls) ([FQDN objects](https://cloud.google.com/firewall/docs/fqdn-objects-overview)) + [Cloud NAT](https://cloud.google.com/nat/docs/overview). Alternative: [Secure Web Proxy](https://cloud.google.com/secure-web-proxy/docs/overview) | Egress allowlist and static egress IPs | Network Firewall + NAT | Azure Firewall |
 | 13 | [Secret Manager](https://cloud.google.com/secret-manager/docs/overview) + [Cloud KMS / CMEK](https://cloud.google.com/kms/docs/cmek) | Secrets and keys | Secrets Manager + KMS | Key Vault |
@@ -109,9 +109,9 @@ flowchart LR
 | 15 | [Cloud Logging](https://cloud.google.com/logging/docs/overview) with [regionalized log buckets](https://docs.cloud.google.com/logging/docs/regionalized-logs), [Cloud Monitoring / Managed Service for Prometheus](https://cloud.google.com/stackdriver/docs/managed-prometheus) ([Cloud Run sidecar](https://cloud.google.com/stackdriver/docs/managed-prometheus/cloudrun-sidecar)) | Logs and metrics, stored in `asia-northeast1` | CloudWatch / AMP | Azure Monitor |
 | 16 | [Cloud Audit Logs](https://cloud.google.com/logging/docs/audit) | Admin Activity + Data Access logs (enable for Vertex AI) | CloudTrail | Activity Log |
 | 17 | [Cloud Billing export to BigQuery](https://cloud.google.com/billing/docs/how-to/export-data-bigquery) + [Vertex AI request labels](https://cloud.google.com/vertex-ai/generative-ai/docs/multimodal/add-labels-to-api-calls) + [Budgets](https://cloud.google.com/billing/docs/how-to/budgets) | Billing truth with per-request label granularity | CUR + inference profiles | Cost Management |
-| 18 | [Workforce Identity Federation (Entra)](https://cloud.google.com/iam/docs/workforce-sign-in-microsoft-entra-id) | Operator console/CLI SSO via Entra | IAM Identity Center | (native) |
+| 18 | [Workforce Identity Federation (Entra)](https://cloud.google.com/iam/docs/workforce-sign-in-microsoft-entra-id) | Operator console/CLI SSO via Entra (CA-GW-05) | IAM Identity Center | (native) |
 | 19 | (Optional) [Chrome Enterprise Premium + Intune connector](https://cloud.google.com/chrome-enterprise-premium/docs/intune-overview) with [IAP](https://cloud.google.com/iap/docs/concepts-overview) | Context-aware access to the admin UI using Intune compliance signals | Verified Access (no Intune) | Entra Private Access |
-| 20 | [Certificate Authority Service](https://cloud.google.com/certificate-authority-service/docs/ca-service-overview) | Workload mTLS certificates | AWS Private CA | Key Vault certs / partner CA |
+| 20 | [Certificate Authority Service](https://cloud.google.com/certificate-authority-service/docs/ca-service-overview) (only if mTLS is adopted) | Workload mTLS certificates | AWS Private CA | Key Vault certs / partner CA |
 | 21 | [Organization policy: resource locations](https://docs.cloud.google.com/organization-policy/restrict-locations) + [logging default settings](https://docs.cloud.google.com/logging/docs/default-settings) | Residency guardrail: only `asia-northeast1`/`asia-northeast2`, with new log buckets created in Japan | SCPs | Azure Policy |
 
 ## 6.3 Request flow walkthrough (GCP)
@@ -120,9 +120,9 @@ flowchart LR
 
 **API request:**
 
-1. **Client → LB.** Internet users hit a **regional external Application LB** in `asia-northeast1`. The *global* external Application LB is not used: it terminates TLS on Google's edge front ends ([Application LB overview](https://cloud.google.com/load-balancing/docs/application-load-balancer)), which are not limited to Japan, so prompts could be decrypted outside Japan. On-premises users and agents reach a **regional internal Application LB** VIP over HA VPN (baseline) or Interconnect (Step 4). Both present the device or workload certificate.
-2. **Cloud Armor** applies preconfigured WAF rules (SQLi, XSS, LFI/RFI), per-client rate-limiting (`rate_based_ban`), and geo/IP rules.
-3. **mTLS.** The LB validates the client certificate against a **TrustConfig** containing the Intune CA ([LB mTLS](https://cloud.google.com/load-balancing/docs/mtls)), then forwards to **Cloud Run** via a serverless NEG. Cloud Run ingress is set to *internal and Cloud Load Balancing*, so the service cannot be reached directly.
+1. **Client → LB.** Office users and DC agents reach a **regional external Application LB** in `asia-northeast1` through their internet breakout (Route B), without TLS inspection [A-15]. The *global* external Application LB is not used: it terminates TLS on Google's edge front ends ([Application LB overview](https://cloud.google.com/load-balancing/docs/application-load-balancer)), which are not limited to Japan, so prompts could be decrypted outside Japan ([§2.6](01-common-design.md#26-ingress-model-applies-to-every-design)). With Route A, split-horizon DNS returns a **regional internal Application LB** VIP reached over Interconnect. Claude Code and Codex CLI send an Entra JWT from their token command; IDE plugins that accept only a pasted key send a virtual key ([§2.3.4](01-common-design.md#234-coding-agent-clients)). If mTLS is adopted, clients present the user's Intune certificate or a workload certificate.
+2. **Cloud Armor** allows only our office/DC egress IPs (with a default-deny rule), then applies preconfigured WAF rules (SQLi, XSS, LFI/RFI) tuned for LLM bodies ([§2.7](01-common-design.md#27-waf-tuning-and-timeouts-for-llm-traffic)) and per-client rate-limiting (`rate_based_ban`).
+3. **mTLS (if adopted).** The LB validates the client certificate against a **TrustConfig** containing the Intune CA ([LB mTLS](https://cloud.google.com/load-balancing/docs/mtls), [§2.3.2](01-common-design.md#232-what-mtls-checks-at-the-load-balancer)) and can pass the certificate serial to the backend in a custom request header for logging. LiteLLM does not match the certificate's user to the token ([§2.3.3](01-common-design.md#233-certificateuser-binding-not-adopted)). The LB then forwards to **Cloud Run** via a serverless NEG. Cloud Run ingress is set to *internal and Cloud Load Balancing*, so the service cannot be reached directly.
 4. **LiteLLM authn/authz.** Same as the other clouds. Cloud Run uses **Direct VPC egress** to reach Memorystore and Cloud SQL private IPs. Cloud SQL is reached through the Cloud SQL Auth Proxy sidecar or a private IP with TLS.
 5. **Guardrails.** The LiteLLM **Model Armor** guardrail runs pre-call and post-call ([LiteLLM Model Armor](https://docs.litellm.ai/docs/proxy/guardrails/model_armor)) through the PSC endpoint.
 6. **Native models.** LiteLLM calls Vertex AI (`vertex_ai/gemini-*`, with `vertex_location: asia-northeast1`) through **PSC for Google APIs**, inside the **VPC-SC perimeter**. Only models that the residency table lists for Japan are configured. `vertex_ai/claude-*` is not used, because Claude on Vertex has no Japan processing option. It authenticates as the Cloud Run **runtime service account** through ADC, with no keys. It attaches **request labels** (`team`, `cost_center`, `project`) so that Gemini (`generateContent`) usage appears in the billing export by label. Labels are forwarded only for **PayGo** and are ignored for Provisioned Throughput. Confirm whether your LiteLLM version forwards Vertex `labels` from request metadata. If it does not, add them with a LiteLLM pre-call hook or a per-team model alias.
@@ -137,11 +137,11 @@ flowchart LR
 | Topic | Design |
 |---|---|
 | SSO to LiteLLM UI | Entra OIDC app (same as the other clouds). Optional extra layer: **IAP** on the UI backend with **Workforce Identity Federation** to Entra ([IAP with WIF](https://cloud.google.com/iap/docs/use-workforce-identity-federation)) and **Chrome Enterprise Premium Intune** access levels ([create Intune access levels](https://cloud.google.com/chrome-enterprise-premium/docs/create-access-levels-intune)). Do not put IAP on the API path, because API clients cannot easily get IAP tokens. |
-| API auth | Entra JWT validated by LiteLLM. Agents running on GCP use **Workload Identity Federation** in the other direction: Entra federated credentials trust Google service account tokens, which lets a GCP workload get an Entra token for `api://litellm-prod`. |
+| API auth | Entra JWT validated by LiteLLM, fetched by the Claude Code and Codex CLI token command ([§2.3.4](01-common-design.md#234-coding-agent-clients)). Agents running on GCP use **Workload Identity Federation** in the other direction: Entra federated credentials trust Google service account tokens, which lets a GCP workload get an Entra token for `api://litellm-prod`. |
 | Group → role mapping | Same as the other clouds (Entra app roles, team sync, SCIM). |
-| Intune compliance | Entra CA (CA-GW-01) at sign-in, plus LB mTLS with Intune device certificates. Optionally, Chrome Enterprise Premium Intune signals for IAP-protected UI paths, which require a CEP license. |
+| Intune compliance | Entra CA (CA-GW-01) at sign-in and at every token issuance and refresh. If mTLS is adopted, also LB mTLS on every request with Intune certificates ([§2.3.2](01-common-design.md#232-what-mtls-checks-at-the-load-balancer)); the certificate's user is not matched to the token ([§2.3.3](01-common-design.md#233-certificateuser-binding-not-adopted)). Optionally, Chrome Enterprise Premium Intune signals for IAP-protected UI paths, which require a CEP license. |
 | Service-to-service | A dedicated Cloud Run runtime SA with `roles/aiplatform.user`, `roles/modelarmor.user`, `roles/secretmanager.secretAccessor`, and `roles/cloudsql.client`. No SA keys, enforced by the org policy `iam.disableServiceAccountKeyCreation`. Cloud SQL **IAM database authentication** is possible through the Auth Proxy (`--auto-iam-authn`). |
-| Operators | Workforce Identity Federation with Entra. Entra group → IAM role bindings at folder or project level. |
+| Operators (scenarios A2, A3 in [§2.9](01-common-design.md#29-access-scenarios-and-checkpoints)) | Workforce Identity Federation with Entra. Entra group → IAM role bindings at folder or project level. The Entra enterprise app for the workforce pool is covered by **CA-GW-05**: phishing-resistant MFA, compliant device, office/DC named locations, and device-code flow blocked. Set the workforce pool session duration to 1 h for admin groups. A VPC Service Controls access level limited to office/DC IPs is the per-call source-IP check for the gateway projects. |
 
 ## 6.5 Cost allocation & token controls (GCP)
 
@@ -160,7 +160,7 @@ flowchart LR
 - **Subnets (`asia-northeast1`; the same layout is repeated in `asia-northeast2` for DR):** `snet-run` (/24) for Direct VPC egress; `snet-proxy-only` (/23) for regional internal/external LB proxies; a PSA range (/20) for Cloud SQL and Memorystore, or PSC-based connectivity for those services.
 - **PSC for Google APIs:** a global internal IP (for example `10.80.255.10`) for the `all-apis` bundle, or `vpc-sc` to restrict to VPC-SC-supported APIs. Cloud DNS private zones for `googleapis.com` (and `REGION-aiplatform.googleapis.com`) map to the PSC IP. On-premises resolvers forward those zones to the Cloud DNS **inbound server policy** IPs ([Vertex PSC from on-prem](https://cloud.google.com/vertex-ai/docs/general/vertex-psc-gen-ai)).
 - **Firewall:** hierarchical firewall policy. Ingress to `snet-run` is not needed for Cloud Run (ingress goes through the LB). Egress from `snet-run` is allowed to PSA ranges, the PSC IP, the on-premises/colocation ranges for optional Japan-region backends, and FQDN objects for Entra and Graph. No public model provider is allowed. Everything else is denied and logged.
-- **Ingress paths:** regional external ALB in `asia-northeast1` (internet zero trust) and regional internal ALB (VPN/Interconnect). In the private-only variant, delete the external LB.
+- **Ingress paths:** **Route B (primary):** the regional external Application LB in `asia-northeast1` with a reserved static IP, and a Cloud Armor allowlist of office/DC egress IPs [A-14]. **Route A (optional):** a regional internal Application LB over Interconnect. Without Route A, the internal LB is not needed. If policy forces a private-only deployment, delete the external LB.
 
 ## 6.7 Data & logging (GCP)
 
@@ -175,8 +175,8 @@ flowchart LR
 
 ## 6.8 Security controls (GCP)
 
-- **WAF:** Cloud Armor preconfigured WAF rules at sensitivity level 1–2 (tune for LLM payloads, which often contain code and SQL-like text that cause false positives), rate limiting, Adaptive Protection, and a stricter policy on admin paths.
-- **mTLS:** LB mTLS with a TrustConfig (Intune CA plus CAS for workloads), and client validation mode `REJECT_INVALID`.
+- **WAF:** a Cloud Armor allow rule for office/DC egress IPs with default deny, preconfigured WAF rules at sensitivity level 1–2 (tune for LLM payloads, which often contain code and SQL-like text that cause false positives; [§2.7](01-common-design.md#27-waf-tuning-and-timeouts-for-llm-traffic)), rate limiting, Adaptive Protection, and a stricter policy on admin paths.
+- **mTLS (recommended option; required in the cases in [§2.3.2](01-common-design.md#232-what-mtls-checks-at-the-load-balancer)):** LB mTLS with a TrustConfig (Intune CA with non-exportable device keys, plus CAS for workloads), and client validation mode `REJECT_INVALID`.
 - **Exfiltration control:** a VPC-SC perimeter. Vertex AI, GCS, BigQuery, and Secret Manager are reachable only from inside it.
 - **Secrets & keys:** Secret Manager with CMEK; Cloud KMS key rotation.
 - **Guardrails / PII:** Model Armor templates (prompt injection, jailbreak, SDP inspect/de-identify, malicious URLs) applied by LiteLLM to **all** models, including external ones. Vertex safety filters apply to Gemini. Presidio is optional.
@@ -185,7 +185,7 @@ flowchart LR
 
 ## 6.9 Scalability & HA (GCP)
 
-- **Compute:** Cloud Run with min instances ≥ 3 (avoids cold starts and keeps Redis connection pools warm), instance-based billing ("CPU always allocated") for background tasks such as spend-log batching and budget resets, concurrency of about 50–80 per instance, and a 60-min request timeout for long streams. **GKE Autopilot** is the alternative if sidecars, Presidio, or a self-hosted model on GKE Inference Gateway are needed.
+- **Compute:** Cloud Run with min instances ≥ 3 (avoids cold starts and keeps Redis connection pools warm), instance-based billing ("CPU always allocated") for background tasks such as spend-log batching and budget resets, concurrency of about 50–80 per instance, and a request timeout of at least 600 s (up to 60 min) for long streams, aligned with LiteLLM `request_timeout` ([§2.7](01-common-design.md#27-waf-tuning-and-timeouts-for-llm-traffic)). **GKE Autopilot** is the alternative if sidecars, Presidio, or a self-hosted model on GKE Inference Gateway are needed.
 - **Data:** Cloud SQL regional HA with a synchronous standby in a second zone. Memorystore HA with a replica in another zone.
 - **Models:** `asia-northeast1` only. Google lists no in-region ML processing for Osaka, so **Vertex has no in-Japan model DR**. LiteLLM fallbacks go to Bedrock `jp.` or Azure OpenAI Japan East over the private path, never to the `global` endpoint or another region.
 - **DR:** Cloud Run in `asia-northeast2`, deployed from the same Terraform. Cloud SQL cross-region replica promotion. Each region has its own regional LBs, and clients fail over by DNS (this replaces the global LB's automatic failover). RTO 15–45 min. Model Armor is not offered in `asia-northeast2`, so the DR gateway calls Model Armor in Tokyo, or falls back to Presidio if Tokyo is down.
