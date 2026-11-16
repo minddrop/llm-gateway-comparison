@@ -2,7 +2,7 @@
 
 > **名称に関する注記:** Google のドキュメントでは現在、Vertex AI のモデル機能とエージェント機能が **Gemini Enterprise Agent Platform** という名称で紹介されている（[モデルの概要](https://cloud.google.com/gemini-enterprise-agent-platform/models)）。本書では、API（`aiplatform.googleapis.com`）と LiteLLM の `vertex_ai/` プロバイダー プレフィックスが変わっていないため「Vertex AI」の名称を使う。実装前に名称とエンドポイントを再確認すること。
 
-**ベースライン:** Google Cloud のセキュリティ基盤（共有 VPC、VPC Service Controls、Private Service Connect）を基に、**Cloud Armor 付きのリージョン外部アプリケーション ロードバランサ**（推奨オプションとして mTLS）の背後に **Cloud Run 上の LiteLLM** を置く。ゲートウェイは **経路 B**（[§2.6](01-common-design.md#26-接続経路モデル全設計に適用)）で公開する。Cloud Armor は当社のオフィスと DC の送信元 IP だけを受け入れ、LiteLLM が Entra トークンを確認し、mTLS を採用する場合はロード バランサーが Intune 証明書を確認する。**経路 A** は任意で、Cloud Interconnect 経由のリージョン内部アプリケーション LB を追加する。Apigee は任意（[§3.3](02-reference-architectures.md#33-google-cloud)）。プライマリ リージョンは **東京（`asia-northeast1`）**、ゲートウェイ インフラの DR リージョンは **大阪（`asia-northeast2`）** とする。[§2.5](01-common-design.md#25-日本国内データ所在全設計に適用) の日本国内所在ルールを全体に適用する。ステップ 4（[§8.4](07-private-connectivity.md#84-gcp-cloud-interconnect-オーバーレイ)）で任意の Cloud Interconnect 経路を説明する。
+**ベースライン:** Google Cloud のセキュリティ基盤（共有 VPC、VPC Service Controls、Private Service Connect）を基に、**Cloud Armor 付きのリージョン外部アプリケーション ロードバランサ**（mTLS は必須の場合だけ）の背後に **Cloud Run 上の LiteLLM** を置く。ゲートウェイは **経路 B**（[§2.6](01-common-design.md#26-接続経路モデル全設計に適用)）で公開する。Cloud Armor は当社のオフィスと DC の送信元 IP だけを受け入れ、LiteLLM が仮想キーを確認する。ロード バランサーが Intune 証明書を確認するのは、[§2.3.2](01-common-design.md#232-ロード-バランサーで-mtls-が確認すること) で mTLS が必須になる場合だけである。**経路 A** は任意で、Cloud Interconnect 経由のリージョン内部アプリケーション LB を追加する。Apigee は任意（[§3.3](02-reference-architectures.md#33-google-cloud)）。プライマリ リージョンは **東京（`asia-northeast1`）**、ゲートウェイ インフラの DR リージョンは **大阪（`asia-northeast2`）** とする。[§2.5](01-common-design.md#25-日本国内データ所在全設計に適用) の日本国内所在ルールを全体に適用する。ステップ 4（[§8.4](07-private-connectivity.md#84-gcp-cloud-interconnect-オーバーレイ)）で任意の Cloud Interconnect 経路を説明する。
 
 ## 6.1 アーキテクチャ図（GCP）
 
@@ -31,7 +31,7 @@ flowchart LR
 
     subgraph SVC["サービス プロジェクト: llm-gateway-prod（asia-northeast1 東京、マルチゾーン）VPC-SC 境界内"]
         direction TB
-        LB["リージョン外部アプリケーション LB<br/>（経路 B: オフィス/DC の IP のみ）<br/>+ リージョン内部 LB（経路 A、任意）<br/>mTLS（TrustConfig: Intune CA）、推奨オプション<br/>+ Cloud Armor（IP 許可リスト、WAF、レート制限）"]
+        LB["リージョン外部アプリケーション LB<br/>（経路 B: オフィス/DC の IP のみ）<br/>+ リージョン内部 LB（経路 A、任意）<br/>mTLS（TrustConfig: Intune CA）、必須の場合のみ<br/>+ Cloud Armor（IP 許可リスト、WAF、レート制限）"]
         RUN["Cloud Run サービス<br/>LiteLLM Proxy + UI<br/>内部受信、最小インスタンス 3<br/>Direct VPC egress<br/>ランタイム SA（キーなし）"]
         SQL[("Cloud SQL for PostgreSQL<br/>Enterprise Plus、リージョン HA<br/>プライベート IP / PSC")]
         MEM[("Memorystore（Valkey / Redis）<br/>HA、プライベート")]
@@ -62,8 +62,8 @@ flowchart LR
     ENTRA <-->|"L5 EAM による MFA"| OKTA
     RUN -->|"L6b トークン交換、JWKS、Graph"| NGFW
 
-    U -->|"1 HTTPS + Entra JWT またはキー<br/>（+ Intune 証明書）<br/>（オフィスのブレイクアウト IP）"| LB
-    AGT -->|"1a DC のブレイクアウト IP + ワークロード証明書"| LB
+    U -->|"1 HTTPS + 仮想キー<br/>（+ Intune 証明書）<br/>（オフィスのブレイクアウト IP）"| LB
+    AGT -->|"1a サービス アカウント用キー<br/>DC のブレイクアウト IP（+ ワークロード証明書）"| LB
     CR -.->|"経路 A（任意）: 内部 LB の VIP"| LB
     LB -->|"2-3 Cloud Armor OK（+ mTLS）<br/>サーバーレス NEG"| RUN
     RUN <-->|"4 予算 / TPM-RPM カウンター"| MEM
@@ -92,11 +92,11 @@ flowchart LR
 
 | # | GCP サービス | 役割 | AWS の相当サービス | Azure の相当サービス |
 |---|---|---|---|---|
-| 1 | [Cloud Load Balancing: アプリケーション LB](https://cloud.google.com/load-balancing/docs/application-load-balancer)。**リージョン** 外部モードとリージョン内部モードのみを使い、[mTLS](https://cloud.google.com/load-balancing/docs/mtls)（すべてのアプリケーション LB で対応）を構成する | `asia-northeast1` での L7 受信。推奨オプション: TrustConfig（Intune CA）によるクライアント証明書の検証 | ALB（mTLS） | App Gateway（mTLS） |
+| 1 | [Cloud Load Balancing: アプリケーション LB](https://cloud.google.com/load-balancing/docs/application-load-balancer)。**リージョン** 外部モードとリージョン内部モードのみを使い、[mTLS](https://cloud.google.com/load-balancing/docs/mtls)（すべてのアプリケーション LB で対応）を構成できる | `asia-northeast1` での L7 受信。mTLS が必須の場合だけ: TrustConfig（Intune CA）によるクライアント証明書の検証 | ALB（mTLS） | App Gateway（mTLS） |
 | 2 | [Cloud Armor](https://cloud.google.com/armor/docs/cloud-armor-overview) | WAF（事前構成済み OWASP ルール）、レート制限、地域/IP ルール、Adaptive Protection | AWS WAF + Shield | App Gateway WAF |
 | 3 | [Cloud Run](https://cloud.google.com/run/docs/overview/what-is-cloud-run)（[受信制御](https://cloud.google.com/run/docs/securing/ingress)、[Direct VPC egress](https://cloud.google.com/run/docs/configuring/vpc-direct-vpc)）。代替: [GKE Autopilot](https://cloud.google.com/kubernetes-engine/docs/concepts/autopilot-overview) | LiteLLM Proxy + UI | ECS Fargate / EKS | Container Apps / AKS |
 | 4 | [Cloud SQL for PostgreSQL](https://cloud.google.com/sql/docs/postgres)（[HA](https://cloud.google.com/sql/docs/postgres/high-availability)）。代替: AlloyDB | LiteLLM DB | Aurora PostgreSQL | PostgreSQL Flexible Server |
-| 5 | [Memorystore for Valkey](https://cloud.google.com/memorystore/docs/valkey) / [Redis](https://cloud.google.com/memorystore/docs/redis) | レート制限と予算のカウンター、キャッシュ | ElastiCache | Azure Managed Redis |
+| 5 | [Memorystore for Valkey](https://cloud.google.com/memorystore/docs/valkey) / [Redis](https://cloud.google.com/memorystore/docs/redis) | レート制限と予算のカウンター（応答キャッシュなし、[§2.8](01-common-design.md#28-プロンプトを見られるのは誰か)） | ElastiCache | Azure Managed Redis |
 | 6 | `asia-northeast1` リージョン エンドポイントの [Vertex AI の生成 AI（ドキュメントは現在 *Gemini Enterprise Agent Platform* の名称）](https://cloud.google.com/gemini-enterprise-agent-platform/models) | Google が日本国内での ML 処理を掲載している Gemini モデルと埋め込みモデルのみ（[データ所在地](https://docs.cloud.google.com/vertex-ai/generative-ai/docs/learn/data-residency)）。Vertex 上の Claude などのパートナー モデルには日本国内処理の選択肢がないため使わない。 | Bedrock `jp.` プロファイル | Azure OpenAI Standard（Japan East） |
 | 7 | `asia-northeast1` の [Model Armor](https://cloud.google.com/model-armor/overview)（[ロケーション](https://docs.cloud.google.com/model-armor/locations)） | プロンプト インジェクション、ジェイルブレイク、機密データ（SDP）、悪意のある URL の検査 | VPC 内ガードレール サービス | Content Safety / Prompt Shields |
 | 8 | [Google API 用 Private Service Connect](https://cloud.google.com/vpc/docs/private-service-connect) | `*.googleapis.com`（Vertex AI、Secret Manager、GCS、Logging）用のプライベート VIP | VPC インターフェイス エンドポイント | プライベート エンドポイント |
@@ -120,9 +120,9 @@ flowchart LR
 
 **API リクエスト:**
 
-1. **クライアント → LB。** オフィスのユーザーと DC のエージェントは、インターネット ブレイクアウトから TLS インスペクションなしで [A-15] `asia-northeast1` の **リージョン外部アプリケーション LB** にアクセスする（経路 B）。*グローバル* 外部アプリケーション LB は使わない。Google のエッジのフロントエンドで TLS を終端し（[アプリケーション LB の概要](https://cloud.google.com/load-balancing/docs/application-load-balancer)）、そのフロントエンドは日本国内に限られないため、プロンプトが日本国外で復号されるおそれがある（[§2.6](01-common-design.md#26-接続経路モデル全設計に適用)）。経路 A の場合は、スプリット ホライズン DNS が Interconnect 経由の **リージョン内部アプリケーション LB** の VIP を返す。Claude Code と Codex CLI はトークン コマンドで得た Entra JWT を送り、貼り付けたキーしか受け付けない IDE プラグインは仮想キーを送る（[§2.3.4](01-common-design.md#234-コーディング-エージェントのクライアント)）。mTLS を採用する場合、クライアントはユーザーの Intune 証明書かワークロード証明書を提示する。
+1. **クライアント → LB。** オフィスのユーザーと DC のエージェントは、インターネット ブレイクアウトから TLS インスペクションなしで [A-15] `asia-northeast1` の **リージョン外部アプリケーション LB** にアクセスする（経路 B）。*グローバル* 外部アプリケーション LB は使わない。Google のエッジのフロントエンドで TLS を終端し（[アプリケーション LB の概要](https://cloud.google.com/load-balancing/docs/application-load-balancer)）、そのフロントエンドは日本国内に限られないため、プロンプトが日本国外で復号されるおそれがある（[§2.6](01-common-design.md#26-接続経路モデル全設計に適用)）。経路 A の場合は、スプリット ホライズン DNS が Interconnect 経由の **リージョン内部アプリケーション LB** の VIP を返す。クライアントはユーザーの個人用仮想キーを送る。Claude Code と Codex CLI はキー ヘルパーを通じて OS のキーチェーンからキーを読む（[§2.3.4](01-common-design.md#234-コーディング-エージェントのクライアント)）。エージェントはチームのサービス アカウント用キーを送る。mTLS を採用する場合、クライアントはユーザーの Intune 証明書かワークロード証明書を提示する。
 2. **Cloud Armor** が当社のオフィス/DC の送信元 IP だけを許可し（既定は拒否）、続いて LLM の本文向けに調整した事前構成済みの WAF ルール（SQLi、XSS、LFI/RFI、[§2.7](01-common-design.md#27-llm-トラフィック向けの-waf-調整とタイムアウト)）とクライアントごとのレート制限（`rate_based_ban`）を適用する。
-3. **mTLS（採用する場合）。** LB は Intune CA を含む **TrustConfig** でクライアント証明書を検証し（[LB の mTLS](https://cloud.google.com/load-balancing/docs/mtls)、[§2.3.2](01-common-design.md#232-ロード-バランサーで-mtls-が確認すること)）、記録用に証明書のシリアル番号をカスタム リクエスト ヘッダーでバックエンドに渡せる。LiteLLM は証明書のユーザーとトークンを照合しない（[§2.3.3](01-common-design.md#233-証明書とユーザーの紐付け-採用しない)）。その後、LB はサーバーレス NEG 経由で **Cloud Run** に転送する。Cloud Run の受信設定は *内部と Cloud Load Balancing* にして、サービスに直接アクセスできないようにする。
+3. **mTLS（採用する場合）。** LB は Intune CA を含む **TrustConfig** でクライアント証明書を検証し（[LB の mTLS](https://cloud.google.com/load-balancing/docs/mtls)、[§2.3.2](01-common-design.md#232-ロード-バランサーで-mtls-が確認すること)）、記録用に証明書のシリアル番号をカスタム リクエスト ヘッダーでバックエンドに渡せる。LiteLLM は証明書のユーザーとキーを照合しない（[§2.3.3](01-common-design.md#233-証明書とユーザーの紐付け-採用しない)）。その後、LB はサーバーレス NEG 経由で **Cloud Run** に転送する。Cloud Run の受信設定は *内部と Cloud Load Balancing* にして、サービスに直接アクセスできないようにする。
 4. **LiteLLM の認証・認可。** 他のクラウドと同じ。Cloud Run は **Direct VPC egress** で Memorystore と Cloud SQL のプライベート IP に接続する。Cloud SQL へは Cloud SQL Auth Proxy サイドカーか、TLS 付きのプライベート IP で接続する。
 5. **ガードレール。** LiteLLM の **Model Armor** ガードレールが PSC エンドポイント経由で呼び出し前と呼び出し後に実行される（[LiteLLM の Model Armor](https://docs.litellm.ai/docs/proxy/guardrails/model_armor)）。
 6. **ネイティブ モデル。** LiteLLM は **VPC-SC 境界** の内側で **Google API 用 PSC** 経由で Vertex AI（`vertex_ai/gemini-*`、`vertex_location: asia-northeast1`）を呼び出す。所在表で日本向けに掲載されているモデルだけを設定する。Vertex 上の Claude には日本国内処理の選択肢がないため、`vertex_ai/claude-*` は使わない。認証は ADC による Cloud Run の **ランタイム サービス アカウント** で行い、キーは使わない。**リクエスト ラベル**（`team`、`cost_center`、`project`）を付与することで、Gemini（`generateContent`）の利用量がラベル別に請求エクスポートに表示される。ラベルが転送されるのは **従量課金（PayGo）** の場合のみで、プロビジョニング スループットでは無視される。使用中の LiteLLM バージョンがリクエスト メタデータから Vertex の `labels` を転送するかを確認すること。転送しない場合は、LiteLLM の呼び出し前フックかチームごとのモデル エイリアスでラベルを付与する。
@@ -137,9 +137,9 @@ flowchart LR
 | 項目 | 設計 |
 |---|---|
 | LiteLLM UI への SSO | Entra OIDC アプリ（他のクラウドと同じ）。任意の追加層として、UI バックエンドに **IAP** を置き、Entra との **Workforce Identity Federation**（[WIF を使った IAP](https://cloud.google.com/iap/docs/use-workforce-identity-federation)）と **Chrome Enterprise Premium の Intune** アクセスレベル（[Intune アクセスレベルの作成](https://cloud.google.com/chrome-enterprise-premium/docs/create-access-levels-intune)）を使う。API クライアントは IAP トークンを簡単に取得できないため、API 経路には IAP を置かない。 |
-| API 認証 | LiteLLM で検証する Entra JWT。Claude Code と Codex CLI のトークン コマンドで取得する（[§2.3.4](01-common-design.md#234-コーディング-エージェントのクライアント)）。GCP 上で動くエージェントは逆方向の **Workload Identity Federation** を使う。Entra のフェデレーション資格情報が Google のサービス アカウント トークンを信頼することで、GCP のワークロードが `api://litellm-prod` の Entra トークンを取得できる。 |
+| API 認証 | LiteLLM で検証する仮想キー。AWS と同じである（[§2.3](01-common-design.md#23-litellm-api-トラフィックの認証方式)、[§4.4](03-aws.md#44-id-とアクセスaws)）。GCP 上で動くエージェントは、チームのサービス アカウント用キーを Secret Manager に置き、Google のサービス アカウントで読む。LiteLLM の JWT 認証は使わない。 |
 | グループとロールの対応付け | 他のクラウドと同じ（Entra アプリ ロール、チーム同期、SCIM）。 |
-| Intune コンプライアンス | サインイン時と、トークンの発行・更新のたびの Entra CA（CA-GW-01）。mTLS を採用する場合は、すべてのリクエストで Intune 証明書による LB の mTLS も適用する（[§2.3.2](01-common-design.md#232-ロード-バランサーで-mtls-が確認すること)）。証明書のユーザーはトークンと照合しない（[§2.3.3](01-common-design.md#233-証明書とユーザーの紐付け-採用しない)）。任意で、IAP で保護した UI パスに Chrome Enterprise Premium の Intune シグナルを使う（CEP ライセンスが必要）。 |
+| Intune コンプライアンス | ユーザーが UI にサインインするとき、つまり個人用キーを作成するときの Entra CA（CA-GW-01）。キーを使うときには再確認しない。[A-16] が成り立つ間は、Cloud Armor の許可リストがその代わりになる（[§2.3.6](01-common-design.md#236-各認証方式が防ぐ脅威)）。mTLS が必須になった場合は、LB がすべてのリクエストで Intune 証明書も確認する（[§2.3.2](01-common-design.md#232-ロード-バランサーで-mtls-が確認すること)）。証明書のユーザーはキーと照合しない（[§2.3.3](01-common-design.md#233-証明書とユーザーの紐付け-採用しない)）。任意で、IAP で保護した UI パスに Chrome Enterprise Premium の Intune シグナルを使う（CEP ライセンスが必要）。 |
 | サービス間認証 | 専用の Cloud Run ランタイム SA に `roles/aiplatform.user`、`roles/modelarmor.user`、`roles/secretmanager.secretAccessor`、`roles/cloudsql.client` を付与する。SA キーは使わず、組織ポリシー `iam.disableServiceAccountKeyCreation` で強制する。Auth Proxy（`--auto-iam-authn`）を使えば Cloud SQL の **IAM データベース認証** も可能である。 |
 | 運用者（[§2.9](01-common-design.md#29-アクセス-シナリオとチェックポイント) のシナリオ A2、A3） | Entra との Workforce Identity Federation。フォルダまたはプロジェクト レベルで Entra グループ → IAM ロールをバインドする。Workforce プールの Entra エンタープライズ アプリには **CA-GW-05** を適用する（フィッシング耐性のある MFA、準拠デバイス、オフィス/DC のネームド ロケーション、デバイス コード フローのブロック）。管理者グループの Workforce プールのセッション時間は 1 時間とする。ゲートウェイのプロジェクトでは、オフィス/DC の IP に限定した VPC Service Controls のアクセスレベルを、呼び出しごとの送信元 IP 確認とする。 |
 
@@ -176,7 +176,7 @@ flowchart LR
 ## 6.8 セキュリティ制御（GCP）
 
 - **WAF:** オフィス/DC の送信元 IP を許可して既定は拒否する Cloud Armor ルール、感度レベル 1〜2 の Cloud Armor 事前構成済み WAF ルール（LLM のペイロードにはコードや SQL に似たテキストが多く誤検知が起きやすいため調整する。[§2.7](01-common-design.md#27-llm-トラフィック向けの-waf-調整とタイムアウト)）、レート制限、Adaptive Protection、管理パスへのより厳格なポリシー。
-- **mTLS（推奨オプション。[§2.3.2](01-common-design.md#232-ロード-バランサーで-mtls-が確認すること) の場合は必須）:** TrustConfig（エクスポート不可のデバイス鍵を持つ Intune CA と、ワークロード用の CAS）を使った LB の mTLS。クライアント検証モードは `REJECT_INVALID`。
+- **mTLS（既定では構築しない。[§2.3.2](01-common-design.md#232-ロード-バランサーで-mtls-が確認すること) の場合だけ必須）:** TrustConfig（エクスポート不可のデバイス鍵を持つ Intune CA と、ワークロード用の CAS）を使った LB の mTLS。クライアント検証モードは `REJECT_INVALID`。
 - **データ流出の制御:** VPC-SC 境界。Vertex AI、GCS、BigQuery、Secret Manager には境界内からのみアクセスできる。
 - **シークレットとキー:** CMEK 付きの Secret Manager、Cloud KMS のキー ローテーション。
 - **ガードレール / PII:** 外部モデルを含む **すべての** モデルに LiteLLM が Model Armor テンプレート（プロンプト インジェクション、ジェイルブレイク、SDP による検査/匿名化、悪意のある URL）を適用する。Gemini には Vertex の安全フィルターも適用される。Presidio は任意。

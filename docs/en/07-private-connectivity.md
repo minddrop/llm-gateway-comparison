@@ -2,13 +2,13 @@
 
 **The proposal:** route gateway and AI-agent traffic over the existing ExpressRoute, Direct Connect, and Cloud Interconnect circuits, the same as other internal traffic. This is **Route A** in [§2.6](01-common-design.md#26-ingress-model-applies-to-every-design).
 
-**Summary position: optional.** Route B (internet + office/DC IP allowlist + Entra, with mTLS as a recommended option) is the primary route. All users are on the corporate network [A-13], so Route A *could* serve everyone. But it adds no identity, device, or encryption protection, and it depends on the carrier contract, circuit bandwidth, DC routing, and DNS forwarding. Build it only when a trigger in §8.0 applies, and keep every Route B identity, device, and encryption control on it.
+**Summary position: optional.** Route B (internet + office/DC IP allowlist + LiteLLM virtual keys, with mTLS only where required) is the primary route. All users are on the corporate network [A-13], so Route A *could* serve everyone. But it adds no identity, device, or encryption protection, and it depends on the carrier contract, circuit bandwidth, DC routing, and DNS forwarding. Build it only when a trigger in §8.0 applies, and keep every Route B identity, device, and encryption control on it.
 
 ## 8.0 When Route A is worth adopting
 
 | Trigger | Why Route A helps |
 |---|---|
-| The office proxy **cannot** exempt `llm.corp.example` from TLS inspection [A-15] | Inspection replaces the laptop's TLS connection, which breaks mTLS on Route B and lets the proxy read prompts and keys. The private path does not pass through the proxy. |
+| The office proxy **cannot** exempt `llm.corp.example` from TLS inspection [A-15] | Inspection replaces the laptop's TLS connection, which lets the proxy read, and possibly log, prompts and virtual keys, and would break mTLS if it becomes required. The private path does not pass through the proxy. |
 | Policy forbids internet-facing endpoints for internal systems | Route A needs only an internal load balancer. |
 | The egress firewall allows only fixed destination IPs, and Global Accelerator is not acceptable (AWS) | On the private path the firewall can allow the whole VPC range. Azure and GCP frontends already have static IPs ([§2.6](01-common-design.md#26-ingress-model-applies-to-every-design)). |
 | Internet breakout capacity or reliability is a problem | Gateway traffic avoids the breakout. Sign-in still uses the internet ([§8.5](#85-what-private-connectivity-does-not-solve-all-clouds)). |
@@ -34,7 +34,7 @@ Before adopting Route A, confirm circuit bandwidth and contract terms with the p
 flowchart LR
     subgraph ONP["On-premises data center"]
         direction TB
-        UOP["Employees on corp LAN<br/>(Intune-compliant, device cert)"]
+        UOP["Employees on corp LAN<br/>(Intune-compliant;<br/>device cert if mTLS adopted)"]
         AGOP["AI agents / apps<br/>(workload cert / Entra WI)"]
         ODNS["Corp DNS<br/>conditional forwarders:<br/>llm.corp.example, *.amazonaws.com"]
         CER["Customer edge routers<br/>(MACsec-capable; in the Tokyo + Osaka<br/>colocation facilities)"]
@@ -93,9 +93,9 @@ flowchart LR
 
 | Topic | Notes |
 |---|---|
-| What DX does and does not protect | DX is a private circuit that is not internet-routed. It **does not encrypt** traffic by default and **does not authenticate** users or devices. Encryption options are [MACsec on dedicated connections](https://docs.aws.amazon.com/directconnect/latest/UserGuide/MACsec.html) (10/100/400 Gbps at supported locations) or a [Private IP VPN over Direct Connect](https://docs.aws.amazon.com/vpn/latest/s2svpn/private-ip-dx.html) terminating on TGW. Keep TLS 1.2+ and mTLS end-to-end regardless. |
+| What DX does and does not protect | DX is a private circuit that is not internet-routed. It **does not encrypt** traffic by default and **does not authenticate** users or devices. Encryption options are [MACsec on dedicated connections](https://docs.aws.amazon.com/directconnect/latest/UserGuide/MACsec.html) (10/100/400 Gbps at supported locations) or a [Private IP VPN over Direct Connect](https://docs.aws.amazon.com/vpn/latest/s2svpn/private-ip-dx.html) terminating on TGW. Keep TLS 1.2+ end-to-end regardless, and mTLS if it is adopted. |
 | Private routing to PaaS/model endpoints | DX transit VIF → DX Gateway → TGW → gateway VPC. Bedrock is reached only by **LiteLLM** through [interface VPC endpoints](https://docs.aws.amazon.com/bedrock/latest/userguide/vpc-interface-endpoints.html). On-premises clients do not need Bedrock DNS. On-premises DNS forwards `llm.corp.example` (a Route 53 private hosted zone) to [Route 53 Resolver inbound endpoints](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/resolver-forwarding-inbound-queries.html). Avoid a **public VIF**: it exposes AWS public endpoints but bypasses VPC endpoint policies. |
-| Traffic that still uses the internet | (a) User sign-in and MFA to Entra ID, Okta, and Okta Verify push, from the user's device through the corporate internet breakout. (b) LiteLLM → Entra token endpoint, JWKS, and Graph, through Network Firewall. **No model traffic**: public model APIs are blocked [A-7], and cross-cloud Japan-region backends (P7) go DX → colocation router → the other cloud's private peering. |
+| Traffic that still uses the internet | (a) User sign-in and MFA to Entra ID, Okta, and Okta Verify push, from the user's device through the corporate internet breakout. (b) LiteLLM → Entra token endpoint, JWKS, and Graph, through Network Firewall, for UI sign-in and team sync only; API requests with virtual keys do not need it. **No model traffic**: public model APIs are blocked [A-7], and cross-cloud Japan-region backends (P7) go DX → colocation router → the other cloud's private peering. |
 | Remote / hybrid workers | Out of scope for this phase [A-13]. If added later, they are not on the DX path. Options: **Entra Private Access** with a connector in the VPC (CA + compliant device per app); the existing corporate VPN to the DC, then DX (hairpin latency); or keep the Route B public mTLS edge for remote users and drop the IP allowlist for them. [AWS Client VPN](https://docs.aws.amazon.com/vpn/latest/clientvpn-admin/what-is.html) with Entra SAML is possible but does not evaluate Intune compliance. |
 | Bandwidth / latency / redundancy / cost | LLM traffic is low-bandwidth (text) but uses many long-lived streaming connections. Model inference time (seconds) dominates DX's latency advantage (milliseconds). Use the [maximum resiliency model](https://docs.aws.amazon.com/directconnect/latest/UserGuide/resiliency_toolkit.html) with DX locations in **Tokyo and Osaka** (2 locations × 2 connections) for 99.99%, which also keeps every physical path in Japan. Incremental cost is small if circuits exist: DX data transfer out (USD 0.041/GB from Tokyo/Osaka to a Japan location), TGW attachment and processing, Resolver endpoints, and MACsec-capable ports if upgrading. Full breakdown: [§8.9](#89-private-connectivity-cost-japan). |
 | Ops complexity / failure modes | BGP route withdrawal or leaks, asymmetric routing between DX and VPN backup, **DNS forwarding failure** (clients fall back to public DNS and fail closed, which is good), MTU issues with IPsec over DX, TGW route-table errors that expose the gateway to other spokes, and MACsec key (CKN/CAK) rotation. Monitor with DX CloudWatch metrics, TGW flow logs, and synthetic probes from on-premises. |
@@ -287,7 +287,7 @@ Key points to communicate to management:
 
 ## 8.7 mTLS explainer
 
-mTLS with Intune certificates is a recommended option in every design, and required in the cases listed in [§2.3.2](01-common-design.md#232-what-mtls-checks-at-the-load-balancer). This section explains what it does and does not protect.
+mTLS with Intune certificates is not built by default. It is required in the cases listed in [§2.3.2](01-common-design.md#232-what-mtls-checks-at-the-load-balancer): unmanaged devices can use our egress IPs, or remote access is added. This section explains what it does and does not protect, so that the decision can be made quickly if a trigger applies.
 
 **How it works (TLS 1.3, simplified):**
 
@@ -303,13 +303,13 @@ sequenceDiagram
     C->>S: CertificateVerify (signature over handshake with device private key)
     S->>S: Validate chain to trust store, validity dates, EKU, revocation (CRL/OCSP)
     S-->>C: Finished (session keys established)
-    C->>S: HTTP request + Authorization: Bearer (Entra JWT / virtual key)
+    C->>S: HTTP request + virtual key (x-api-key or Authorization: Bearer)
     S->>S: Forward cert headers → LiteLLM (serial logged; no user match, §2.3.3)
 ```
 
 | | mTLS secures | mTLS does **not** secure / limitations |
 |---|---|---|
-| **Authentication** | *Mutual* authentication: the client proves possession of a private key bound to a certificate from a trusted CA (device or workload identity), and the server proves its identity to the client | It is **not user authentication or authorization**. A valid device cert says nothing about *which user* or *which models and budgets*. Entra JWT, virtual keys, and LiteLLM RBAC are still required. |
+| **Authentication** | *Mutual* authentication: the client proves possession of a private key bound to a certificate from a trusted CA (device or workload identity), and the server proves its identity to the client | It is **not user authentication or authorization**. A valid device cert says nothing about *which user* or *which models and budgets*. Virtual keys and LiteLLM RBAC are still required. |
 | **Encryption** | Confidentiality and integrity in transit between client and TLS terminator, with forward secrecy (TLS 1.3) | Only up to the **termination point** (LB). The LB → backend hop needs its own TLS. A corporate **TLS-inspecting proxy** breaks mTLS, so exempt `llm.corp.example` from inspection. |
 | **Certificate lifecycle** | Automatable: Intune SCEP/PKCS profiles for devices; Private CA / Key Vault / CAS for workloads | Issuance, renewal, and CA rotation are operational work. Expired certs cause outages, so monitor expiry and use 30–90 day validity with auto-renewal. |
 | **Revocation** | CRL/OCSP checks at the edge, where supported (ALB supports CRLs; check App Gateway and Google LB capabilities per region) | Revocation is often slow or unsupported. Short-lived certs are more reliable than CRLs. Compliance loss in Intune does not automatically revoke the cert unless that is automated. |
@@ -335,17 +335,17 @@ They are **complementary**: the dedicated line reduces *exposure*, and mTLS prov
 
 | Layer | Control (all clouds) |
 |---|---|
-| **User identity** | Entra ID OIDC/JWT for UI and API; Claude Code and Codex CLI fetch tokens with a token command. Okta Verify via **EAM** for MFA, phishing-resistant for admins. Short token lifetimes. SCIM deprovisioning. Virtual keys only for tools that accept a pasted key. |
-| **Device** | Intune compliance enforced by **Conditional Access** at every token issuance and refresh. **Recommended option** (required if [A-16] does not hold or remote access is added): an Intune-issued, TPM-bound **device certificate** checked by **mTLS** at the gateway edge. |
+| **User identity** | Entra ID OIDC SSO for the UI, where users create their personal virtual keys within upper bounds. Okta Verify via **EAM** for MFA, phishing-resistant for admins. Every API client uses a virtual key with a 30–90 day expiry; Claude Code and Codex CLI read it from the OS keychain ([§2.3](01-common-design.md#23-authentication-modes-for-litellm-api-traffic)). SCIM deprovisioning revokes keys. |
+| **Device** | Intune compliance enforced by **Conditional Access** at sign-in, when keys are created. On each request, the IP allowlist stands in for the device check while unmanaged devices cannot use our egress IPs ([A-16], gate V-11). **Only if that fails or remote access is added:** an Intune-issued, TPM-bound **device certificate** checked by **mTLS** at the gateway edge. |
 | **Operator access** | CA-GW-05 on the cloud control-plane apps (phishing-resistant MFA, compliant device, office/DC named locations), source-IP conditions in cloud IAM, and 1 h admin sessions ([§2.9](01-common-design.md#29-access-scenarios-and-checkpoints)). |
-| **Workload** | Agents authenticate with Entra workload identity (federated credentials), plus **mTLS workload certificates** if mTLS is adopted. Service-account virtual keys only as an exception, with expiry, budgets, and IP scoping. |
-| **Network** | **Route B is the default:** office and DC clients reach a Tokyo load balancer that admits only our egress IPs, with WAF + Entra (+ mTLS if adopted), terminated in Tokyo. **Route A** (an internal-only load balancer over the dedicated lines) is added only on a trigger in §8.0. No CDN or global edge. Models are reached only through private endpoints, or through the private lines for another cloud's Japan-region models. Egress is allowlisted, with no public model APIs. |
+| **Workload** | Agents and apps use team **service-account virtual keys** from their own secret store, rotated at least every 90 days, with budgets, model lists, and a dedicated egress IP. **mTLS workload certificates** only if mTLS is adopted. |
+| **Network** | **Route B is the default:** office and DC clients reach a Tokyo load balancer that admits only our egress IPs, with WAF + virtual keys (+ mTLS if adopted), terminated in Tokyo. **Route A** (an internal-only load balancer over the dedicated lines) is added only on a trigger in §8.0. No CDN or global edge. Models are reached only through private endpoints, or through the private lines for another cloud's Japan-region models. Egress is allowlisted, with no public model APIs. |
 | **Transport encryption** | TLS 1.2+ (prefer 1.3) end-to-end, including LB → LiteLLM → model. **MACsec or IPsec over the circuits** if data classification requires link-layer encryption. |
 | **Authorization & usage** | LiteLLM RBAC, model access groups, budgets, and TPM/RPM per org, team, user, and key. Cloud quotas as the outer limit. |
 | **Data** | Guardrails on every request (PII, prompt injection), processed in Japan. Metadata-only logging by default. CMK encryption. Immutable audit. Every store, backup, and export is in Tokyo or Osaka ([§2.5](01-common-design.md#25-japan-data-residency-applies-to-every-design)). |
-| **Detect & respond** | Entra sign-in logs, WAF, firewall, and LiteLLM audit/spend anomalies in Sentinel or the SIEM. Key revocation on user offboarding through SCIM, once verified ([§2.4](01-common-design.md#24-litellm-tenancy-model-same-on-all-clouds)). Device non-compliance does **not** revoke virtual keys, because nothing links a key to a device; it takes effect at the next Entra token issuance (U2) or through mTLS certificate revocation. |
+| **Detect & respond** | Entra sign-in logs, WAF, firewall, and LiteLLM audit/spend anomalies in Sentinel or the SIEM. Key revocation on user offboarding through SCIM, once verified ([§2.4](01-common-design.md#24-litellm-tenancy-model-same-on-all-clouds)). Alerts when one key is used from several IPs or user agents, and secret scanning for the key format ([§2.3.6](01-common-design.md#236-threats-each-authentication-option-blocks)). Device non-compliance does **not** revoke virtual keys, because nothing links a key to a device; it takes effect at the user's next sign-in, or through mTLS certificate revocation if mTLS is adopted. |
 
-> **Bottom line for management:** the gateway's security comes from user MFA, device compliance, the IP allowlist, and mTLS where adopted, and those are the same on both routes. Routing over ExpressRoute, Direct Connect, and Interconnect reduces internet exposure, but adds contract, bandwidth, and operational dependencies, and is **not** a substitute for any of those controls. Start on the internet route; add the private route when a specific trigger requires it.
+> **Bottom line for management:** the gateway's security comes from user MFA and device compliance when keys are issued, the IP allowlist with only managed devices behind it, limits on every key, and mTLS if it becomes required. Those are the same on both routes. Routing over ExpressRoute, Direct Connect, and Interconnect reduces internet exposure, but adds contract, bandwidth, and operational dependencies, and is **not** a substitute for any of those controls. Start on the internet route; add the private route when a specific trigger requires it.
 
 ## 8.9 Private connectivity cost (Japan)
 

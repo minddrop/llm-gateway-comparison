@@ -1,6 +1,6 @@
 # 5. ステップ 2b: Azure 設計
 
-**ベースライン:** Microsoft Foundry チャットのベースラインと APIM ランディング ゾーン アクセラレーターの *ネットワーク構成*（App Gateway WAF → 内部ワークロード → プライベート エンドポイント → Azure Firewall による送信）を基に、ゲートウェイとして APIM の代わりに **Azure Container Apps（内部環境）上の LiteLLM** を置く。プライマリ リージョンは **Japan East**、DR リージョンはそのペア リージョンである **Japan West** とする。[§2.5](01-common-design.md#25-日本国内データ所在全設計に適用) の日本国内所在ルールを全体に適用する。ゲートウェイは **経路 B**（[§2.6](01-common-design.md#26-接続経路モデル全設計に適用)）で公開する。App Gateway のパブリック フロントエンドは当社のオフィスと DC の送信元 IP だけを受け入れ、LiteLLM で Entra JWT を確認する。推奨オプションとして Intune 証明書による mTLS も確認する。**経路 A** は任意で、ステップ 4（[§8.3](07-private-connectivity.md#83-azure-expressroute-オーバーレイ)）で ExpressRoute 経由の App Gateway プライベート フロントエンドを使う。
+**ベースライン:** Microsoft Foundry チャットのベースラインと APIM ランディング ゾーン アクセラレーターの *ネットワーク構成*（App Gateway WAF → 内部ワークロード → プライベート エンドポイント → Azure Firewall による送信）を基に、ゲートウェイとして APIM の代わりに **Azure Container Apps（内部環境）上の LiteLLM** を置く。プライマリ リージョンは **Japan East**、DR リージョンはそのペア リージョンである **Japan West** とする。[§2.5](01-common-design.md#25-日本国内データ所在全設計に適用) の日本国内所在ルールを全体に適用する。ゲートウェイは **経路 B**（[§2.6](01-common-design.md#26-接続経路モデル全設計に適用)）で公開する。App Gateway のパブリック フロントエンドは当社のオフィスと DC の送信元 IP だけを受け入れ、LiteLLM で仮想キーを確認する（Intune 証明書による mTLS は [§2.3.2](01-common-design.md#232-ロード-バランサーで-mtls-が確認すること) で必須になる場合だけ追加する）。**経路 A** は任意で、ステップ 4（[§8.3](07-private-connectivity.md#83-azure-expressroute-オーバーレイ)）で ExpressRoute 経由の App Gateway プライベート フロントエンドを使う。
 
 ## 5.1 アーキテクチャ図（Azure）
 
@@ -29,7 +29,7 @@ flowchart LR
     subgraph SPOKE["ワークロード サブスクリプション: llm-gateway-prod（Japan East、ゾーン冗長、DR: Japan West）"]
         direction TB
         subgraph SNAGW["snet-appgw"]
-            AGW["Application Gateway WAF v2<br/>パブリック フロントエンド: オフィス/DC の IP のみ<br/>プライベート フロントエンド: 経路 A（任意）<br/>mTLS（信頼されたクライアント CA）、推奨オプション<br/>DRS + ボット ルール、要求タイムアウト 600 秒"]
+            AGW["Application Gateway WAF v2<br/>パブリック フロントエンド: オフィス/DC の IP のみ<br/>プライベート フロントエンド: 経路 A（任意）<br/>mTLS（信頼されたクライアント CA）、必須の場合のみ<br/>DRS + ボット ルール、要求タイムアウト 600 秒"]
         end
         subgraph SNACA["snet-aca（委任、ワークロード プロファイル）"]
             ACA["Azure Container Apps（内部環境）<br/>LiteLLM Proxy + UI<br/>最小 3 レプリカ、ゾーン冗長<br/>ユーザー割り当てマネージド ID"]
@@ -68,8 +68,8 @@ flowchart LR
     ENTRA <-->|"L5 EAM による MFA"| OKTA
     ACA -->|"L6b トークン交換、JWKS、Graph"| AFW
 
-    U -->|"1 HTTPS + Entra JWT またはキー<br/>（+ Intune 証明書）<br/>（オフィスのブレイクアウト IP）"| AGW
-    AGT -->|"1a DC のブレイクアウト IP + ワークロード証明書"| AGW
+    U -->|"1 HTTPS + 仮想キー<br/>（+ Intune 証明書）<br/>（オフィスのブレイクアウト IP）"| AGW
+    AGT -->|"1a サービス アカウント用キー<br/>DC のブレイクアウト IP（+ ワークロード証明書）"| AGW
     VPNGW -.->|"経路 A（任意）: プライベート フロントエンド"| AGW
     AGW -->|"2-3 WAF OK（+ mTLS）→ プライベート IP"| ACA
     ACA <-->|"4 予算 / TPM-RPM カウンター"| AMR
@@ -100,10 +100,10 @@ flowchart LR
 
 | # | Azure サービス | 役割 | AWS の相当サービス | GCP の相当サービス |
 |---|---|---|---|---|
-| 1 | [Application Gateway WAF v2](https://learn.microsoft.com/azure/web-application-firewall/ag/ag-overview)（[相互認証](https://learn.microsoft.com/azure/application-gateway/mutual-authentication-overview)） | リージョン L7 受信、OWASP CRS/DRS、ボット対策、パブリック + プライベート フロントエンド。推奨オプション: クライアント証明書の検証（Intune CA）。 | ALB + AWS WAF（mTLS） | 外部/内部アプリケーション LB + Cloud Armor（mTLS） |
+| 1 | [Application Gateway WAF v2](https://learn.microsoft.com/azure/web-application-firewall/ag/ag-overview)（[相互認証](https://learn.microsoft.com/azure/application-gateway/mutual-authentication-overview)） | リージョン L7 受信、OWASP CRS/DRS、ボット対策、パブリック + プライベート フロントエンド。mTLS が必須の場合だけ: クライアント証明書の検証（Intune CA）。 | ALB + AWS WAF（mTLS） | 外部/内部アプリケーション LB + Cloud Armor（mTLS） |
 | 2 | [Azure Container Apps](https://learn.microsoft.com/azure/container-apps/overview)（内部環境、[ゾーン冗長](https://learn.microsoft.com/azure/reliability/reliability-container-apps)） | LiteLLM Proxy + UI。代替: ワークロード ID を使う [AKS](https://learn.microsoft.com/azure/aks/what-is-aks) | ECS Fargate / EKS | Cloud Run / GKE |
 | 3 | [Azure Database for PostgreSQL Flexible Server](https://learn.microsoft.com/azure/postgresql/flexible-server/overview)（[ゾーン冗長 HA](https://learn.microsoft.com/azure/postgresql/high-availability/concepts-high-availability)） | LiteLLM DB | Aurora PostgreSQL | Cloud SQL / AlloyDB |
-| 4 | [Azure Managed Redis](https://learn.microsoft.com/azure/redis/overview) | レート制限と予算のカウンター、キャッシュ | ElastiCache | Memorystore |
+| 4 | [Azure Managed Redis](https://learn.microsoft.com/azure/redis/overview) | レート制限と予算のカウンター（応答キャッシュなし、[§2.8](01-common-design.md#28-プロンプトを見られるのは誰か)） | ElastiCache | Memorystore |
 | 5 | [Azure OpenAI in Foundry Models](https://learn.microsoft.com/azure/foundry/foundry-models/concepts/models-sold-directly-by-azure)。Japan East の [Standard と Regional Provisioned のデプロイの種類](https://learn.microsoft.com/azure/foundry/foundry-models/concepts/deployment-types) だけを使う | 日本ジオグラフィ内で処理されるネイティブ モデル（GPT ファミリーと、Japan East で Standard として提供される Foundry Models）。リージョン PTU と Standard 従量課金のデプロイ。 | Bedrock `jp.` プロファイル | Vertex AI `asia-northeast1` |
 | 6 | Japan East の [Azure AI Content Safety](https://learn.microsoft.com/azure/ai-services/content-safety/overview) / [Prompt Shields](https://learn.microsoft.com/azure/ai-services/content-safety/concepts/jailbreak-detection)（[リージョンの提供状況](https://learn.microsoft.com/azure/ai-services/content-safety/region-availability)） | コンテンツ フィルタリングとジェイルブレイク検出。LiteLLM から呼び出す。Azure OpenAI 組み込みのコンテンツ フィルターに追加して使う。 | VPC 内ガードレール サービス（Bedrock Guardrails は日本国内に閉じない） | Model Armor |
 | 7 | [プライベート エンドポイント](https://learn.microsoft.com/azure/private-link/private-endpoint-overview) + [プライベート DNS ゾーン](https://learn.microsoft.com/azure/private-link/private-endpoint-dns) | Azure OpenAI（`privatelink.openai.azure.com`）、Key Vault、Storage、ACR、Redis、PostgreSQL、Monitor（AMPLS）への閉域アクセス | VPC インターフェイス エンドポイント | Private Service Connect |
@@ -127,9 +127,9 @@ flowchart LR
 
 **API リクエスト:**
 
-1. **クライアント → 受信。** オフィスのノート PC は `llm.corp.example` を App Gateway の **パブリック** フロントエンドに解決する。その NSG と WAF はオフィスと DC の送信元 IP だけを受け入れる（経路 B）。リクエストは TLS インスペクションなしでオフィスのブレイクアウトから出ていく [A-15]。経路 A の場合は、スプリット ホライズン DNS が ExpressRoute 経由の **プライベート** フロントエンドを返す。Claude Code と Codex CLI はトークン コマンドで得た Entra JWT を送り、貼り付けたキーしか受け付けない IDE プラグインは仮想キーを送る（[§2.3.4](01-common-design.md#234-コーディング-エージェントのクライアント)）。mTLS を採用する場合、クライアントはユーザーの Intune 証明書を、エージェントはワークロード証明書を提示する。
+1. **クライアント → 受信。** オフィスのノート PC は `llm.corp.example` を App Gateway の **パブリック** フロントエンドに解決する。その NSG と WAF はオフィスと DC の送信元 IP だけを受け入れる（経路 B）。リクエストは TLS インスペクションなしでオフィスのブレイクアウトから出ていく [A-15]。経路 A の場合は、スプリット ホライズン DNS が ExpressRoute 経由の **プライベート** フロントエンドを返す。クライアントはユーザーの個人用仮想キーを送る。Claude Code と Codex CLI はキー ヘルパーを通じて OS のキーチェーンからキーを読む（[§2.3.4](01-common-design.md#234-コーディング-エージェントのクライアント)）。エージェントはチームのサービス アカウント用キーを送る。mTLS を採用する場合、クライアントはユーザーの Intune 証明書を、エージェントはワークロード証明書を提示する。
 2. **App Gateway WAF** が Microsoft Default Rule Set と Bot Manager、オフィス/DC の送信元 IP の許可ルール、カスタムのレート制限、LLM のリクエスト向けに調整した本文設定を適用する（[§2.7](01-common-design.md#27-llm-トラフィック向けの-waf-調整とタイムアウト)）。既定の 128 KB の本文上限はコーディング エージェントには小さすぎる。
-3. **App Gateway mTLS（採用する場合）** が、アップロード済みの信頼されたクライアント CA（Intune が証明書を配布する元の CA）でクライアント証明書チェーンを検証する（[§2.3.2](01-common-design.md#232-ロード-バランサーで-mtls-が確認すること)）。記録用に証明書のシリアル番号をサーバー変数としてバックエンドに渡せる。LiteLLM は証明書のユーザーとトークンを照合しない（[§2.3.3](01-common-design.md#233-証明書とユーザーの紐付け-採用しない)）。その後、トラフィックは HTTPS で **内部 Container Apps 環境** のプライベート IP に送られる。バックエンドの要求タイムアウトは既定の 20 秒から 600 秒に引き上げる。
+3. **App Gateway mTLS（採用する場合）** が、アップロード済みの信頼されたクライアント CA（Intune が証明書を配布する元の CA）でクライアント証明書チェーンを検証する（[§2.3.2](01-common-design.md#232-ロード-バランサーで-mtls-が確認すること)）。記録用に証明書のシリアル番号をサーバー変数としてバックエンドに渡せる。LiteLLM は証明書のユーザーとキーを照合しない（[§2.3.3](01-common-design.md#233-証明書とユーザーの紐付け-採用しない)）。その後、トラフィックは HTTPS で **内部 Container Apps 環境** のプライベート IP に送られる。バックエンドの要求タイムアウトは既定の 20 秒から 600 秒に引き上げる。
 4. **LiteLLM の認証・認可** は AWS（[§4.3](03-aws.md#43-リクエスト-フローの説明aws) ステップ 5）と同様に動作する。Redis には **Azure Managed Redis**、DB には **PostgreSQL Flexible Server** を使い、どちらもプライベート エンドポイントまたは VNet 統合で接続する。
 5. **ガードレール。** LiteLLM はプライベート エンドポイント経由で **Azure AI Content Safety / Prompt Shields** を呼び出す（[LiteLLM の Azure コンテンツ ガードレール](https://docs.litellm.ai/docs/proxy/guardrails/azure_content_guardrail)）。Azure でホストされるモデルには Azure OpenAI 組み込みのコンテンツ フィルターも適用される。
 6. **ネイティブ モデル。** LiteLLM はプライベート エンドポイント経由で Azure OpenAI のデプロイを呼び出し、**Container App のマネージド ID による Entra ID 認証** を使う（[LiteLLM の Azure プロバイダー](https://docs.litellm.ai/docs/providers/azure)、ロールは *Cognitive Services OpenAI User*）。Azure OpenAI リソースのパブリック ネットワーク アクセスは無効にする（[Azure AI サービスのネットワーク](https://learn.microsoft.com/azure/ai-services/cognitive-services-virtual-networks)）。LiteLLM ルーターは、[マルチバックエンド ゲートウェイ ガイド](https://learn.microsoft.com/azure/architecture/ai-ml/guide/generative-ai-gateway-multiple-models) の推奨どおり、Regional Provisioned（PTU）デプロイを優先し、Standard デプロイにスピルオーバーする。これらのデプロイはすべて Japan East にあり、モデルが提供されていれば Japan West も加える。Japan East にないモデルのために誰かが Global や Data Zone のデプロイを作成することは、Azure Policy が防ぐ。
@@ -144,9 +144,9 @@ flowchart LR
 | 項目 | 設計 |
 |---|---|
 | LiteLLM UI への SSO | LiteLLM の Microsoft SSO 設定を使った Entra OIDC アプリ登録。クライアント シークレットは Key Vault に保管し、マネージド ID 経由で ACA のシークレットとして参照する。 |
-| API 認証 | LiteLLM で検証する Entra JWT（AWS と同じ）。Claude Code と Codex CLI のトークン コマンドで取得する（[§2.3.4](01-common-design.md#234-コーディング-エージェントのクライアント)）。Azure では、Azure 内の *ワークロード* の呼び出し元が **マネージド ID** で `api://litellm-prod` の Entra トークンを取得するため、シークレットが一切不要になる。 |
+| API 認証 | LiteLLM で検証する仮想キー。AWS と同じである（[§2.3](01-common-design.md#23-litellm-api-トラフィックの認証方式)、[§4.4](03-aws.md#44-id-とアクセスaws)）。Azure 内の *ワークロード* の呼び出し元は、チームのサービス アカウント用キーを Key Vault に置き、**マネージド ID** で読む。マネージド ID を使えば保存するシークレットなしで Entra トークンを取得できるが、LiteLLM の JWT 認証は使わない（[§2.3.1](01-common-design.md#231-リクエストごとに誰が何を検証するか)）。 |
 | グループとロールの対応付け | Entra アプリ ロール → LiteLLM ロール。`llm-team-*` グループ → LiteLLM チーム（チーム同期）。プロビジョニング解除は SCIM。**エンタープライズ アプリへのグループ割り当て** と「割り当てられたグループのみ」のトークン クレームを使う。 |
-| Intune コンプライアンス | **ネイティブ**: CA-GW-01 で、トークンの発行・更新のたびに `litellm-prod` アプリに準拠デバイスを必須にする。mTLS を採用する場合は、すべてのリクエストで App Gateway の Intune 証明書でも適用する（[§2.3.2](01-common-design.md#232-ロード-バランサーで-mtls-が確認すること)）。証明書のユーザーはトークンと照合しない（[§2.3.3](01-common-design.md#233-証明書とユーザーの紐付け-採用しない)）。後でリモート アクセスを追加する場合は [A-13]、**Entra Private Access** で同じ CA ポリシーをリモート ユーザーに適用する。3 クラウドの中で Intune との統合が最も緊密である。 |
+| Intune コンプライアンス | **ネイティブ**: CA-GW-01 で、ユーザーが `litellm-prod` アプリにサインインするとき、つまり個人用キーを作成するときに準拠デバイスを必須にする。キーを使うときには再確認しない。[A-16] が成り立つ間は、NSG と WAF の許可リストがその代わりになる（[§2.3.6](01-common-design.md#236-各認証方式が防ぐ脅威)）。mTLS が必須になった場合は、App Gateway がすべてのリクエストで Intune 証明書も確認する（[§2.3.2](01-common-design.md#232-ロード-バランサーで-mtls-が確認すること)）。証明書のユーザーはキーと照合しない（[§2.3.3](01-common-design.md#233-証明書とユーザーの紐付け-採用しない)）。後でリモート アクセスを追加する場合は [A-13]、**Entra Private Access** で同じ CA ポリシーをリモート ユーザーに適用する。3 クラウドの中で Intune との統合が最も緊密である。 |
 | サービス間認証 | ACA のユーザー割り当てマネージド ID → Azure OpenAI、Content Safety、Key Vault、Storage、ACR を、最小権限ロールの RBAC で構成する。PostgreSQL は Key Vault のパスワードを使う。PostgreSQL の Entra 認証も可能だが、LiteLLM の DB クライアントがトークン更新に対応している必要があるため、採用前に確認すること。AKS を選ぶ場合は [AKS ワークロード ID](https://learn.microsoft.com/azure/aks/workload-identity-overview) を使う。 |
 | 運用者（[§2.9](01-common-design.md#29-アクセス-シナリオとチェックポイント) のシナリオ A2、A3） | PIM で資格付与する Azure RBAC ロール。アクティブ化時間は 1 時間とする。常時の Owner 権限は持たない。**CA-GW-05** を Azure の管理（ポータル、Azure CLI、PowerShell）に適用する（フィッシング耐性のある MFA、準拠デバイス、オフィス/DC のネームド ロケーション、デバイス コード フローのブロック）。Azure RBAC には送信元 IP 条件がないため、サインイン時のネームド ロケーションがネットワークの確認になる。Azure Policy でプライベート エンドポイントとパブリック アクセスの無効化を強制する。 |
 
@@ -186,7 +186,7 @@ flowchart LR
 ## 5.8 セキュリティ制御（Azure）
 
 - **WAF:** 防止モードの App Gateway WAF v2。Microsoft DRS 2.x、Bot Manager、オフィス/DC の IP 許可ルール、カスタムのレート制限ルール、LLM のリクエスト向けに調整した本文設定とルール除外（[§2.7](01-common-design.md#27-llm-トラフィック向けの-waf-調整とタイムアウト)）、管理パスへのより厳格なポリシー。Front Door は使わない（[§2.6](01-common-design.md#26-接続経路モデル全設計に適用)）。そのグローバルなエッジは日本国外で TLS を終端してプロンプトを復号する可能性があり、App Gateway からはクライアント証明書ではなく Front Door の接続が見えることになる。
-- **mTLS（推奨オプション。[§2.3.2](01-common-design.md#232-ロード-バランサーで-mtls-が確認すること) の場合は必須）:** Intune CA（デバイス、エクスポート不可の鍵）と社内 CA（ワークロード）による App Gateway の相互認証。使用する App Gateway の SKU とリージョンで対応していれば CRL/OCSP チェックを有効にし、対応していなければ短命な証明書を使う。
+- **mTLS（既定では構築しない。[§2.3.2](01-common-design.md#232-ロード-バランサーで-mtls-が確認すること) の場合だけ必須）:** Intune CA（デバイス、エクスポート不可の鍵）と社内 CA（ワークロード）による App Gateway の相互認証。使用する App Gateway の SKU とリージョンで対応していれば CRL/OCSP チェックを有効にし、対応していなければ短命な証明書を使う。
 - **シークレットとキー:** Key Vault（RBAC モデル、消去保護、プライベート エンドポイント）。PostgreSQL、Storage、Azure OpenAI では、対応している範囲で CMK を使う。
 - **ガードレール / PII:** Azure OpenAI 既定のコンテンツ フィルターとデプロイごとのカスタム フィルター ポリシー、LiteLLM の呼び出し前 **Prompt Shields** と Content Safety。PII マスキングには Presidio。Azure OpenAI 向けに Defender for Cloud の AI 脅威保護。
 - **ポリシー:** Azure Policy イニシアチブで、Cognitive Services、Key Vault、Storage、PostgreSQL のパブリック ネットワーク アクセスを拒否し、プライベート エンドポイント、診断設定、タグを必須にする。所在要件のため、場所を Japan East と Japan West に制限し、Global、Data Zone、Developer のデプロイ SKU も拒否する。
@@ -194,7 +194,7 @@ flowchart LR
 
 ## 5.9 スケーラビリティと HA（Azure）
 
-- **コンピューティング:** 専用ワークロード プロファイル上の Container Apps を、ゾーン冗長、最小 3・最大 N レプリカで構成する。同時リクエスト数に基づく KEDA の HTTP スケーリングを使う。App Gateway のバックエンド要求タイムアウトは 600 秒（既定 20 秒）、LiteLLM の `request_timeout` も 600 秒にする。Container Apps のイングレスには引き上げられない 240 秒の要求タイムアウトが文書化されている（[§2.7](01-common-design.md#27-llm-トラフィック向けの-waf-調整とタイムアウト)）。長い推論ストリームを早期に試験すること。ストリームがこの上限を超える場合や、サイドカー、カスタム受信、既存の AKS 運用が必要な場合は **AKS** が代替となる。
+- **コンピューティング:** 専用ワークロード プロファイル上の Container Apps を、ゾーン冗長、最小 3・最大 N レプリカで構成する。同時リクエスト数に基づく KEDA の HTTP スケーリングを使う。App Gateway のバックエンド要求タイムアウトは 600 秒（既定 20 秒）にし、LiteLLM の `request_timeout` は前段で最も短い層より短くする。Container Apps ではそれは 240 秒のイングレス上限である。Container Apps のイングレスには引き上げられない 240 秒の要求タイムアウトが文書化されている（[§2.7](01-common-design.md#27-llm-トラフィック向けの-waf-調整とタイムアウト)）。長い推論ストリームをこれに対して早期に試験すること。ストリームがこの上限を超える場合や、サイドカー、カスタム受信、既存の AKS 運用が必要な場合は **AKS** が代替となる。
 - **データ:** PostgreSQL のゾーン冗長 HA（別 AZ に同期スタンバイ）。ゾーン冗長の Azure Managed Redis。マルチリージョンにはアクティブ geo レプリケーションが使える。
 - **モデル:** LiteLLM ルーターで Standard と Regional Provisioned のデプロイをまたぎ、PTU を優先して Standard にスピルオーバーする。Standard デプロイは容量確保のため日本のどちらのリージョンでも処理されうるが（[デプロイの種類](https://learn.microsoft.com/azure/foundry/foundry-models/concepts/deployment-types)）、いずれも日本国内である。フォールバック先は閉域経路の Bedrock `jp.` に限り、Global や Data Zone のデプロイには決してフォールバックしない。
 - **DR:** 同じ Bicep/Terraform からデプロイする Japan West のスポーク。PostgreSQL の geo リストアまたは読み取りレプリカの昇格。App Gateway 間は Traffic Manager または DNS でフェイルオーバーする。RTO は 30〜60 分。**注意:** Content Safety は Japan West では提供されておらず（[リージョンの提供状況](https://learn.microsoft.com/azure/ai-services/content-safety/region-availability)）、Japan West での Azure OpenAI のモデル提供状況はモデルごとに確認が必要である（[モデルの提供状況](https://learn.microsoft.com/azure/foundry/foundry-models/concepts/models-sold-directly-by-azure)）。そのため部分的な障害の間、DR ゲートウェイは引き続き Japan East の Content Safety と Azure OpenAI を呼び出す。Japan East 全体が停止した場合、ガードレールはフェイルクローズにするか Presidio にフォールバックし、モデルは Japan West のデプロイ（あれば）または Bedrock `jp.` にフォールバックする。

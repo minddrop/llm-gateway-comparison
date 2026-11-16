@@ -16,9 +16,9 @@ There are three ways to combine Okta MFA with an Entra ID–centric estate:
 
 | CA policy | Target | Grant controls |
 |---|---|---|
-| CA-GW-01 | All users → `litellm-prod` (web/UI + API audience) | Require MFA, satisfied by Okta EAM, **and** require a device marked compliant ([Intune compliance in CA](https://learn.microsoft.com/entra/identity/conditional-access/policy-all-users-device-compliance)) |
+| CA-GW-01 | All users → `litellm-prod` (Admin UI sign-in, where personal virtual keys are issued) | Require MFA, satisfied by Okta EAM, **and** require a device marked compliant ([Intune compliance in CA](https://learn.microsoft.com/entra/identity/conditional-access/policy-all-users-device-compliance)) |
 | CA-GW-02 | Admin role holders (`proxy_admin`) | Require MFA plus a compliant device, sign-in frequency of 4–8 h, phishing-resistant MFA where available (Okta FastPass, or Windows Hello for Business as an Entra method) |
-| CA-GW-03 | Workload identities (service principals that call the gateway) | Restrict to named locations (cloud egress IPs, on-premises NAT) using Conditional Access for workload identities (requires the Workload ID premium license) |
+| CA-GW-03 | Workload identities (service principals that call the gateway) | **Not used.** Workloads authenticate with service-account virtual keys, not Entra tokens ([§2.3](#23-authentication-modes-for-litellm-api-traffic)). If Entra workload identity is adopted later: restrict to named locations (cloud egress IPs, on-premises NAT) using Conditional Access for workload identities (requires the Workload ID premium license). |
 | CA-GW-04 | Block legacy authentication and device-code flow for `litellm-prod` | Block |
 | CA-GW-05 | Cloud control-plane apps for operators (the IAM Identity Center enterprise app, Azure management, Google Workforce Identity Federation) | Phishing-resistant MFA, a compliant device, **named locations limited to office and DC egress IPs**, and a sign-in frequency of 4–8 h. CA-GW-04 covers only `litellm-prod`, so block device-code flow here as well. ([§2.9](#29-access-scenarios-and-checkpoints), scenarios A2–A3) |
 
@@ -57,39 +57,39 @@ Notes:
 
 ## 2.3 Authentication modes for LiteLLM API traffic
 
+**Decision: every API client uses a LiteLLM virtual key, behind the office/DC IP allowlist.** Entra tokens (JWT) are not used for API traffic, and mTLS is built only in the cases in [§2.3.2](#232-what-mtls-checks-at-the-load-balancer). Entra still authenticates the user, with MFA and a compliant device, when they sign in to the Admin UI to get their key. [§2.3.6](#236-threats-each-authentication-option-blocks) compares this with Entra tokens and mTLS threat by threat, and shows why it is enough while unmanaged devices cannot use our egress IPs [A-16].
+
 | Client type | Auth to LiteLLM | How device trust is enforced | Notes |
 |---|---|---|---|
 | Admin UI (browser) | Entra OIDC SSO (L1–L7) | Conditional Access CA-GW-01/02 at sign-in | Roles come from Entra **app roles** (`proxy_admin`, `proxy_admin_viewer`, `internal_user`, `internal_user_viewer`). See the [MSFT SSO tutorial](https://docs.litellm.ai/docs/tutorials/msft_sso) and [Entra app roles](https://learn.microsoft.com/entra/identity-platform/howto-add-app-roles-in-apps). |
-| CLI coding agents (Claude Code, Codex CLI), SDKs, chat front-ends (for example Open WebUI) | **Default:** Entra access token (JWT), fetched by a helper command and validated by LiteLLM [OIDC/JWT auth](https://docs.litellm.ai/docs/proxy/token_auth) (team from the `groups` claim via `team_ids_jwt_field` / alias mapping). Scenario U2 in [§2.9](#29-access-scenarios-and-checkpoints). | CA re-checks the device **every time the token is issued or refreshed** (≈60–90 min lifetime). On every request: the office/DC IP allowlist (Route B) or the private path (Route A), plus the Intune certificate (mTLS) if adopted ([§2.3.2](#232-what-mtls-checks-at-the-load-balancer)). | Helper setup per tool: [§2.3.4](#234-coding-agent-clients). JWTs can be mapped to virtual-key-equivalent controls (budgets, TPM/RPM). See [JWT → key mapping](https://docs.litellm.ai/docs/proxy/jwt_key_mapping). |
-| IDE plugins and tools that accept only a pasted key | **Fallback:** personal virtual key with a 30–90 day expiry. Scenario U3 in [§2.9](#29-access-scenarios-and-checkpoints). | CA only when the key is created; **nothing re-checks the device when the key is used.** On every request: the IP allowlist, plus mTLS if adopted. mTLS is the only control that stops a copied key from working on an unmanaged device inside the office ([A-16]). | Keep this group small; move a tool to the default row as soon as it can run a token command. Users cannot create these keys themselves; admins or the CI pipeline issue them ([§2.3.5](#235-key-issuance-the-master-key-and-allowlisted-workloads)). |
-| Internal app / AI agent (workload) | Option 1: Entra **workload identity**. The client-credentials JWT, or a federated credential from AWS/GCP/K8s, is validated by LiteLLM JWT auth. Option 2: a team-scoped **service-account virtual key** stored in the caller's secret store and rotated. | Network scoping (DC or cloud egress IPs on the allowlist, or the private path), plus mTLS workload certificates if mTLS is adopted. Never allowlist a shared NAT ([§2.3.5](#235-key-issuance-the-master-key-and-allowlisted-workloads)). | Prefer Option 1, because it removes long-lived secrets. |
-| CI/automation (key management API) | Admin virtual key held only in a secrets manager, or JWT with an admin scope | Fixed CI egress IPs on the allowlist, plus a workload certificate if mTLS is adopted; stricter WAF rules on admin paths | Use the LiteLLM management APIs (`/key/generate`, `/team/new`) through IaC and pipelines. Do not use ad-hoc UI changes in production. |
+| User API clients: CLI coding agents (Claude Code, Codex CLI), IDE plugins, SDKs | **Personal virtual key**, one per user, with a 30–90 day expiry. The user creates it in the Admin UI within fixed upper bounds ([§2.3.5](#235-key-issuance-the-master-key-and-allowlisted-workloads)). Scenario U2 in [§2.9](#29-access-scenarios-and-checkpoints). | CA-GW-01 (MFA and a compliant device) when the user signs in to create or renew the key. **Nothing re-checks the device when the key is used.** On every request: the office/DC IP allowlist (Route B) or the private path (Route A). [A-16] is what makes "from our network" mean "from a managed device". The Intune certificate (mTLS) only where [§2.3.2](#232-what-mtls-checks-at-the-load-balancer) requires it. | Claude Code and Codex CLI read the key from the OS credential store through a helper command ([§2.3.4](#234-coding-agent-clients)). Tools that accept only a pasted key keep it in their own settings. |
+| Internal app / AI agent / chat front-end (workload) | Team-scoped **service-account virtual key**, stored in the caller's secret store and rotated at least every 90 days. A chat front-end such as Open WebUI uses one key and passes each user's ID in the request's `user` field, so spend can be shown per person (V-7 in [§2.10](#210-launch-gates-verify-before-production)). | Network scoping: a dedicated DC or cloud egress IP on the allowlist, or the private path. Never allowlist a shared NAT ([§2.3.5](#235-key-issuance-the-master-key-and-allowlisted-workloads)). mTLS workload certificates only where [§2.3.2](#232-what-mtls-checks-at-the-load-balancer) requires mTLS. | One key per workload, never a person's key. Budget, TPM/RPM, and an explicit model list on every key. |
+| CI/automation (key management API) | Admin virtual key held only in a secrets manager | Fixed CI egress IPs on the allowlist; stricter WAF rules on admin paths | Use the LiteLLM management APIs (`/key/generate`, `/team/new`) through IaC and pipelines. Do not use ad-hoc UI changes in production. |
 
 ### 2.3.1 Who verifies what on each request
 
-The cloud providers' own services do not identify the end user. The WAF checks the network origin, the load balancer checks the Intune device certificate if mTLS is adopted, and **LiteLLM** checks the user against Entra. The model service (Bedrock, Azure OpenAI, Vertex AI) sees only the gateway's own workload identity, so per-user attribution comes from LiteLLM spend logs.
+The cloud providers' own services do not identify the end user. The WAF and load balancer check the network origin, plus the Intune device certificate where mTLS is required. **LiteLLM** identifies the user from the virtual key. Each personal key has one owner, the Entra user who created it, so Entra authenticated that user when the key was issued, not on each request. The model service (Bedrock, Azure OpenAI, Vertex AI) sees only the gateway's own workload identity, so per-user attribution comes from LiteLLM spend logs.
 
 | Step | Component | What it checks | Knows the user? |
 |---|---|---|---|
-| 0 | Entra ID, at sign-in and at every token refresh (SaaS, outside the cloud) | Primary authentication, Okta Verify MFA through EAM, and Intune compliance through CA-GW-01. Then it issues an access token for `api://litellm-prod`, valid for about 60–90 min ([access token claims](https://learn.microsoft.com/entra/identity-platform/access-token-claims-reference)). | Yes (it issues the token) |
-| 1 | WAF and load-balancer allowlist | The source IP is one of our office or DC egress IPs [A-14] | No |
-| 2 | Load balancer (mTLS), **recommended option** | Certificate chain to the Intune CA, proof of the private key, validity dates, revocation ([§2.3.2](#232-what-mtls-checks-at-the-load-balancer)) | No. It proves a managed device, not a user. |
-| 3 | LiteLLM | The Entra token: signature against Entra's published keys (JWKS), issuer = our tenant, audience = `api://litellm-prod`, expiry. Or the virtual key: exists, not expired, not blocked. Then app role or group → team, model access, budget, and TPM/RPM. | **Yes. The user is verified here.** |
+| 0 | Entra ID, when the user signs in to the Admin UI (SaaS, outside the cloud) | Primary authentication, Okta Verify MFA through EAM, and Intune compliance through CA-GW-01. This is where the user creates or renews their personal key ([§2.3.5](#235-key-issuance-the-master-key-and-allowlisted-workloads)). It is not repeated on API requests. | Yes |
+| 1 | WAF and load-balancer allowlist | The source IP is one of our office or DC egress IPs [A-14]. While [A-16] holds, this also means a managed device. | No |
+| 2 | Load balancer (mTLS), **only where required** | Certificate chain to the Intune CA, proof of the private key, validity dates, revocation ([§2.3.2](#232-what-mtls-checks-at-the-load-balancer)) | No. It proves a managed device, not a user. |
+| 3 | LiteLLM | The virtual key: exists (hash lookup), not expired, not blocked. Then the key's owner and team → model access, budget, and TPM/RPM. | **Yes. The key identifies the user.** |
 | 4 | Cloud IAM → model | The gateway's workload identity (task role, managed identity, or service account) may call only Japan-processed models | No |
 
-LiteLLM's JWT auth is an Enterprise feature [A-6]. Without the license, every client uses virtual keys (scenario U3 in [§2.9](#29-access-scenarios-and-checkpoints)), and steps 1 and 2 carry the network and device checks on their own. mTLS then stops being optional.
+**Entra tokens for API traffic: not adopted.** A token command could fetch an Entra token about every hour, and Conditional Access would re-check the device each time. [§2.3.6](#236-threats-each-authentication-option-blocks) shows that this blocks only threats that the network controls in [A-16] and [§2.3.5](#235-key-issuance-the-master-key-and-allowlisted-workloads) already block. Against that, it needs LiteLLM's Enterprise JWT feature [A-6], a token command on every client, and a working Entra sign-in for every client about once an hour. If remote access is added [A-13], revisit this together with mTLS.
 
 ### 2.3.2 What mTLS checks at the load balancer
 
-**Status: recommended option.** Entra checks the device only when it issues a token. A LiteLLM virtual key is never seen by Entra after it is created, so the IP allowlist is the only other check on it, and the allowlist proves only the network, not the device. mTLS with Intune-issued certificates is the one control that stops a copied key from working on an unmanaged device that shares our egress IP. The user does nothing to set it up: Intune deploys the certificate, and an unmanaged device fails the TLS handshake because it never received one.
+**Status: conditional. Not built by default.** A LiteLLM virtual key is never seen by Entra after it is issued, so on each request the IP allowlist is the only check besides the key itself, and the allowlist proves the network, not the device. That is enough while [A-16] holds ([§2.3.6](#236-threats-each-authentication-option-blocks)). mTLS with Intune-issued certificates is the control that stops a copied key from working on an unmanaged device that shares our egress IP. The user does nothing to set it up: Intune deploys the certificate, and an unmanaged device fails the TLS handshake because it never received one.
 
-Adopt it as **required** when any of these is true:
+It becomes **required** when either of these is true:
 
-- [A-16] does not hold: an unmanaged device (guest or BYOD Wi-Fi, an unauthenticated LAN port) can leave through the office or DC egress IPs, or nobody can confirm that it can't.
+- [A-16] does not hold: an unmanaged device (guest or BYOD Wi-Fi, an unauthenticated LAN port) can leave through the office or DC egress IPs, or nobody can confirm that it can't. Gate V-11 ([§2.10](#210-launch-gates-verify-before-production)) tests this.
 - Remote access is added [A-13], which removes the IP allowlist.
-- We run without the LiteLLM Enterprise license [A-6], so every client uses virtual keys.
 
-Otherwise it is still worth building, and the cost is mainly on the client side: the TLS-inspection exemption [A-15] and the CLI certificate handling in [§2.3.4](#234-coding-agent-clients).
+Otherwise it is not built. If it becomes required, most of the work is on the client side: the TLS-inspection exemption [A-15], an Intune certificate profile with non-exportable keys, and a local mTLS helper for the CLIs ([§2.3.4](#234-coding-agent-clients)). The rest of this section describes what it checks, so that each design is ready if a trigger applies.
 
 During the TLS handshake, before any HTTP request exists, the load balancer asks the client for a certificate and checks four things:
 
@@ -102,9 +102,9 @@ If any check fails, the connection is refused and LiteLLM never sees the request
 
 **What mTLS does not check:**
 
-- **Compliance at this moment.** A certificate stays valid until it expires or is revoked. Compliance is enforced when Entra issues the token, which is why the design needs both.
+- **Compliance at this moment.** A certificate stays valid until it expires or is revoked. Entra checks compliance only when the user signs in (CA-GW-01).
 - **Revocation by itself.** Intune revokes certificates when a device is retired or wiped, or when the profile is removed (depending on the CA). It does not revoke them when a device merely falls out of compliance. Publish the CRL to the load balancer on a schedule, and keep certificate validity short (30–90 days, auto-renewed).
-- **Which process on the device.** mTLS and the token command both prove a device, not a program. Any process running as the signed-in user can run the token command, and a local mTLS helper ([§2.3.4](#234-coding-agent-clients)) signs handshakes for whatever connects to it. Malware on a compliant laptop passes every check in this design. Device trust ends at the device boundary; endpoint protection is what covers the laptop itself.
+- **Which process on the device.** mTLS proves a device, not a program. Any process running as the signed-in user can read the virtual key through the key helper, and a local mTLS helper signs handshakes for whatever connects to it ([§2.3.4](#234-coding-agent-clients)). Malware on a compliant laptop passes every check in this design. Device trust ends at the device boundary; endpoint protection is what covers the laptop itself.
 
 **Key protection: the condition that makes mTLS work.** Set the **Intune certificate profile** to put the private key in the TPM (Windows) or the keychain / Secure Enclave (macOS) and to make it **non-exportable** ([Intune certificate profiles](https://learn.microsoft.com/intune/fundamentals/certificates/overview)). This is the certificate's private key, not a LiteLLM key. A non-exportable key cannot be copied to another machine, so a valid signature means "this managed laptop". If the key is exportable, a user can copy the certificate and key to a personal PC together with a virtual key, and mTLS passes there too.
 
@@ -112,12 +112,12 @@ If any check fails, the connection is refused and LiteLLM never sees the request
 
 Conditional Access "require compliant device" checks that the device is registered in our tenant and compliant. It does **not** check that the person signing in is the device's enrolled user, and mTLS proves only a managed device. So a user who is given a colleague's virtual key can use it from their own managed laptop.
 
-We considered closing this with a custom LiteLLM pre-call check that compares the UPN in an Intune user certificate with the token's user or the key's owner. **We do not adopt it.** It catches only one case, an employee using a colleague's key from their own managed laptop. The harm in that case is wrong cost attribution, not data loss, because the colleague could get their own key. Against that, it needs a custom hook maintained across LiteLLM upgrades, safeguards against spoofed certificate headers, and it fails when a second user signs in to Windows on the same laptop. It also cannot stop a user who relays requests for someone else from their own laptop.
+We considered closing this with a custom LiteLLM pre-call check that compares the UPN in an Intune user certificate with the key's owner. It would need mTLS, which is itself conditional ([§2.3.2](#232-what-mtls-checks-at-the-load-balancer)). **We do not adopt it.** It catches only one case, an employee using a colleague's key from their own managed laptop. The harm in that case is wrong cost attribution, not data loss, because the colleague could get their own key. Against that, it needs a custom hook maintained across LiteLLM upgrades, safeguards against spoofed certificate headers, and it fails when a second user signs in to Windows on the same laptop. It also cannot stop a user who relays requests for someone else from their own laptop.
 
 Instead:
 
 - Issue keys through SSO only, so every key has an owner, and keep the 30–90 day expiry.
-- Prefer Entra tokens (scenario U2), which belong to the person who signed in and last about an hour.
+- Make each key's owner its only user: the acceptable-use policy forbids sharing keys, and the SIEM alerts when one key is used from several IPs or user agents.
 - Use phishing-resistant MFA (Okta FastPass or Windows Hello for Business), which stops a colleague from completing someone else's sign-in by having them approve a push.
 - Watch per-user spend and request-source anomalies in the SIEM.
 
@@ -125,38 +125,65 @@ Revisit the decision if key sharing becomes common or a team with sensitive data
 
 ### 2.3.4 Coding agent clients
 
-The official CLIs we support, **Claude Code** and **Codex CLI**, both run a command to get their credential and re-run it before it expires. That is exactly what Entra tokens need, so both use scenario U2 by default.
+The official CLIs we support, **Claude Code** and **Codex CLI**, both run a command to get their credential. We use that command to read the user's personal virtual key from the OS credential store, so the key is not kept in a plain-text config file or environment variable.
 
 | | Claude Code | Codex CLI |
 |---|---|---|
 | Endpoint | `ANTHROPIC_BASE_URL=https://llm.corp.example` → LiteLLM's Anthropic-compatible `/v1/messages` | A custom provider in `~/.codex/config.toml`: `[model_providers.litellm]` with `base_url = "https://llm.corp.example/v1"` |
-| Token command | [`apiKeyHelper`](https://code.claude.com/docs/en/authentication.md#credential-management): a script whose output is the credential, documented for "short-lived tokens" | [`model_providers.<id>.auth.command`](https://learn.chatgpt.com/docs/config-file/config-reference): prints a bearer token; `auth.refresh_interval_ms` sets the refresh (default 5 min) |
+| Key helper | [`apiKeyHelper`](https://code.claude.com/docs/en/authentication.md#credential-management): a script whose output is the credential | [`model_providers.<id>.auth.command`](https://learn.chatgpt.com/docs/config-file/config-reference): prints a bearer token; `auth.refresh_interval_ms` sets how often it is re-run (default 5 min) |
 | How it is deployed | Managed settings (`managed-settings.json`) pushed by Intune | User-level `config.toml` pushed by Intune. Project-level `.codex/config.toml` cannot set providers. |
-| Client certificate, if mTLS is adopted | `CLAUDE_CODE_CLIENT_CERT` / `CLAUDE_CODE_CLIENT_KEY`, **files only** | No client-certificate option for model providers in the current config reference (verify before rollout) |
+| Client certificate, only if mTLS is required | `CLAUDE_CODE_CLIENT_CERT` / `CLAUDE_CODE_CLIENT_KEY`, **files only** | No client-certificate option for model providers in the current config reference (verify before rollout) |
 
-- **The token command.** Both tools can share one small command (for example `litellm-token`) that uses MSAL to print an Entra access token for `api://litellm-prod/.default`. It must use the **OS sign-in broker**: WAM on Windows, the Enterprise SSO plug-in or Platform SSO on macOS. Without the broker the token request carries no device identity, so CA-GW-01's compliant-device check fails or cannot run. Device-code flow is blocked by CA-GW-04, so the sign-in always happens on the same machine. Users normally see no prompt, because the broker reuses their Windows or Mac sign-in.
-- **Headers.** LiteLLM's JWT auth reads `Authorization: Bearer`. The EKS sample ([§3.1](02-reference-architectures.md#31-aws)) documents that LiteLLM's virtual-key check reads `x-api-key`, so a static `ANTHROPIC_AUTH_TOKEN` alone is not enough for keys; Claude Code's `apiKeyHelper` sends the credential on both headers.
-- **Tools that need a static key (scenario U3).** Many IDE plugins accept only a pasted key and cannot run a command. Give those users a personal virtual key with a 30–90 day expiry. The IP allowlist, and mTLS if adopted, limit where it works.
-- **Client certificates (the main practical risk if mTLS is adopted).** Browsers use the OS certificate store, but these CLIs do not. Claude Code reads the certificate and key only as files, and a non-exportable TPM key cannot become a file; Codex CLI shows no certificate option at all. Test every supported tool early, then choose per tool: a small local forward proxy that performs the mTLS handshake with the TPM key (the tool points `base_url` at `localhost`), or an exportable key for that tool only, which weakens mTLS to "a copy of the certificate exists" (see Key protection in [§2.3.2](#232-what-mtls-checks-at-the-load-balancer)). A local helper must listen only on the loopback interface. It still accepts any local process, so it does not narrow device trust below the device ([§2.3.2](#232-what-mtls-checks-at-the-load-balancer)). If [A-16] cannot be confirmed, mTLS is required, and this client-side choice has to be made and tested per tool before launch, not after.
+- **The key helper.** Both tools share one small command (for example `litellm-key`) that prints the user's virtual key from Windows Credential Manager or the macOS Keychain. The user stores the key once after creating it (for example `litellm-key set`), and again when they renew it. Intune deploys the command together with the managed settings, so users configure nothing else. The helper does not stop a process on the laptop from reading the key ([§2.3.6](#236-threats-each-authentication-option-blocks), row 5). It keeps the key out of dotfiles, shell history, and backups, which is where copied keys usually come from. If Entra tokens are adopted later, only this command changes.
+- **Headers.** The EKS sample ([§3.1](02-reference-architectures.md#31-aws)) documents that LiteLLM's virtual-key check reads `x-api-key`, so a static `ANTHROPIC_AUTH_TOKEN` alone is not enough for keys; Claude Code's `apiKeyHelper` sends the credential on both headers. Codex CLI sends it as `Authorization: Bearer`. Test both tools against the pinned LiteLLM version.
+- **Tools that accept only a pasted key.** Many IDE plugins cannot run a command and keep the key in their own settings. They use the same personal key. The IP allowlist limits where a copied key works ([§2.3.6](#236-threats-each-authentication-option-blocks)).
+- **Client certificates (only if mTLS becomes required).** Browsers use the OS certificate store, but these CLIs do not. Claude Code reads the certificate and key only as files, and a non-exportable TPM key cannot become a file; Codex CLI shows no certificate option at all. Test every supported tool early, then choose per tool: a small local forward proxy that performs the mTLS handshake with the TPM key (the tool points `base_url` at `localhost`), or an exportable key for that tool only, which weakens mTLS to "a copy of the certificate exists" (see Key protection in [§2.3.2](#232-what-mtls-checks-at-the-load-balancer)). A local helper must listen only on the loopback interface. It still accepts any local process, so it does not narrow device trust below the device ([§2.3.2](#232-what-mtls-checks-at-the-load-balancer)). If [A-16] cannot be confirmed, mTLS is required, and this client-side choice has to be made and tested per tool before launch, not after.
 
 ### 2.3.5 Key issuance, the master key, and allowlisted workloads
 
 Three kinds of credential stop being checked by Entra once they exist. Each needs its own control.
 
-**User-created virtual keys.** LiteLLM describes the `internal_user` role as one that "can login, view/create/delete their own keys" ([virtual keys](https://docs.litellm.ai/docs/proxy/virtual_keys)). If that is left as it is, any user who signs in with an Entra token (U2) can create a 30–90 day key (U3) and use it without Conditional Access for the life of the key. Restrict issuance:
+**Personal virtual keys.** Every user API client uses one ([§2.3](#23-authentication-modes-for-litellm-api-traffic)). LiteLLM describes the `internal_user` role as one that "can login, view/create/delete their own keys" ([virtual keys](https://docs.litellm.ai/docs/proxy/virtual_keys)). We use that as the issuance path: the user signs in to the Admin UI through Entra (MFA and a compliant device, CA-GW-01) and creates their own key. Each key then has an owner, and the device was compliant when the key was issued. The limits are what make self-service safe:
 
-- `key_generation_settings`, which the docs describe as the way "to control who can generate keys": personal keys only by `proxy_admin`, and team keys only by team admins. U3 keys are requested through a workflow, and the CI pipeline creates them.
 - `upperbound_key_generate_params`: a maximum `duration` (90 days), budget, and TPM/RPM. The docs say values above the upper bound are rejected, not clamped.
-- Gate V-2 ([§2.10](#210-launch-gates-verify-before-production)): in the pinned LiteLLM version, a JWT caller with the `internal_user` role must be refused by `/key/generate`.
+- `key_generation_settings`, which the docs describe as the way "to control who can generate keys": users create personal keys only for themselves; team and service-account keys are created only by team admins or the CI pipeline.
+- A user-level budget and TPM/RPM. The policy is one active personal key per user. A user may still hold two for a while (for example while renewing), and the pinned version may not limit the number of keys per user, so the user-level limits keep extra keys from multiplying the allowance.
+- Revocation at offboarding: SCIM [A-6], or a job that blocks a user's keys when Entra disables the account ([§2.4](#24-litellm-tenancy-model-same-on-all-clouds)).
+- Self-service needs Admin UI SSO for every user, which needs the Enterprise license above 5 users [A-6]. Without it, users request keys through a workflow, and the CI pipeline creates them.
+- Gate V-2 ([§2.10](#210-launch-gates-verify-before-production)): in the pinned LiteLLM version, an `internal_user` cannot create a key above the upper bounds, for another user or team, or with admin permissions.
 
 **The master key.** `LITELLM_MASTER_KEY` "authenticates admin API calls and is the Admin UI login password" ([production guide](https://docs.litellm.ai/docs/proxy/prod)). It is a static admin credential that Entra never sees, and it is accepted from every allowlisted IP.
 
-- It lives only in the secrets manager. Nobody uses it for routine work; admins sign in through SSO (A1), and automation uses its own admin key or JWT.
+- It lives only in the secrets manager. Nobody uses it for routine work; admins sign in through SSO (A1), and automation uses its own admin key.
 - The principals that can read the secret are in effect proxy admins. Review them with the other admin roles.
 - Rotate it on a schedule and when an admin leaves. With `LITELLM_SALT_KEY` set, rotation is a new value and a restart of every instance, with no data migration ([master key rotation](https://docs.litellm.ai/docs/proxy/master_key_rotations)).
 - **Open:** the LiteLLM pages above do not document a way to turn off master-key login on the Admin UI while SSO is enabled. Gate V-3 checks the pinned version. If it cannot be turned off, the `/ui` login accepts the master key from every allowlisted IP, and only the handling of the secret protects it.
 
 **Allowlisted workload egress IPs.** N1 admits every host behind an allowlisted IP. Add only egress IPs that serve the gateway's real callers. Do not allowlist a shared NAT, such as the egress VPC in a central network account, because every workload behind it then passes N1. Cloud-hosted agents use a dedicated egress IP or the private path (Route A).
+
+### 2.3.6 Threats each authentication option blocks
+
+This table compares the three ways an API client can authenticate on Route B, and is the reason for the decision in [§2.3](#23-authentication-modes-for-litellm-api-traffic). All three sit behind the same IP allowlist (N1). A source IP cannot usefully be spoofed: the load balancer's TCP reply goes to the real owner of the address, so the handshake never completes. A stolen credential is therefore useful only to someone who can really send traffic from an allowlisted IP.
+
+| # | Threat | Virtual key + IP allowlist (**chosen**, U2) | Adding mTLS (only if required, [§2.3.2](#232-what-mtls-checks-at-the-load-balancer)) | Entra token + IP allowlist (not adopted) | Fix outside client authentication |
+|---|---|---|---|---|---|
+| 1 | A key or token leaks to the internet (Git, chat, paste sites) and is used from outside | Blocked by the allowlist | Blocked | Blocked | Secret scanning with push protection for the key format |
+| 2 | Malware, a malicious package or IDE extension, or a prompt-injected coding agent steals the credential and uses it from outside | Blocked by the allowlist | Blocked | Blocked | EDR. Keep the key in the OS keychain and read it through `apiKeyHelper` or `auth.command` ([§2.3.4](#234-coding-agent-clients)), not in a plain-text config file. |
+| 3 | An employee copies the credential to a home PC | Blocked by the allowlist | Blocked | Blocked | None needed |
+| 4 | An unmanaged device inside our network (guest or BYOD Wi-Fi on the same egress, an open LAN port) uses a copied credential | **Not blocked** | Blocked: no certificate, so the handshake fails | Blocked once the copied token expires (≈60–90 min). The device cannot get a new one. | Separate egress IPs for guest and BYOD networks, and 802.1X/NAC on the LAN and Wi-Fi [A-16], tested by gate V-11 |
+| 5 | Malware or a prompt-injected agent uses the credential on the managed laptop itself | **Not blocked** | **Not blocked**. mTLS proves the device, not the process. | **Not blocked** | EDR. MCP write tools only for teams that need them. Per-key budget and TPM/RPM. |
+| 6 | A former employee's key is still valid | Works only from inside the allowlist, until revoked | Same as virtual key | Blocked once the Entra account is disabled | Revoke keys at offboarding: SCIM [A-6], or a job triggered when Entra disables the account ([§2.3.5](#235-key-issuance-the-master-key-and-allowlisted-workloads)) |
+| 7 | A user shares a credential with a colleague | **Not blocked** | **Not blocked**. The colleague's laptop is managed too. | Hard. The token expires within about an hour, and a new one needs the owner's sign-in. | One key per user. Alert when one key is used from several IPs or user agents. |
+| 8 | A workload behind an allowlisted shared NAT, which should not call the gateway, uses a stolen credential | **Not blocked** | Blocked if workloads must present workload certificates | **Not blocked** while the stolen token is valid | Dedicated egress IPs for the gateway's callers. Never allowlist a shared NAT ([§2.3.5](#235-key-issuance-the-master-key-and-allowlisted-workloads)). |
+| 9 | A TLS-inspecting proxy reads and logs credentials and prompts | **Not blocked** | mTLS fails through inspection, which forces the exemption | **Not blocked** | Exempt `llm.corp.example` from TLS inspection [A-15] |
+| 10 | A legitimate user overspends or misuses tools | **Not blocked** | **Not blocked** | **Not blocked** | Budgets, TPM/RPM, model and MCP tool scoping, and spend alerts ([§2.4](#24-litellm-tenancy-model-same-on-all-clouds)) |
+
+**How to read it:**
+
+- **Rows 1–3** are the most common ways credentials leak, and the allowlist blocks all of them whichever option is used. That is why the allowlist stays on every route, and why it must admit only dedicated egress IPs used by managed devices.
+- **mTLS or Entra tokens add protection only in rows 4, 6, 7, and 8.** Each of those rows has a fix outside client authentication in the last column. With those fixes in place, virtual keys plus the allowlist block the same threats as the other two options. They also need no certificates or token service on the client, and have fewer ways to fail: no certificate expiry, and no dependence on Entra for API calls.
+- **No option blocks rows 5 and 10.** Key scope, EDR, and logging are the controls there, whichever option is chosen. A coding agent can read its own credential, so assume a prompt injection can reach it, and limit what the key can do.
+- **When a fix cannot be confirmed, that row is the reason to add mTLS or Entra tokens.** The usual case is A-16 for row 4, which gate V-11 tests before launch. Also revisit this table when remote access is added [A-13]. That removes the allowlist, and rows 1–3 become "Not blocked" for virtual keys.
 
 ## 2.4 LiteLLM tenancy model (same on all clouds)
 
@@ -203,7 +230,7 @@ flowchart TB
 2. **Budgets and rate limits are enforced from Redis and Postgres state.** If Redis is unavailable, LiteLLM's multi-instance limits degrade. Each design uses a zone-redundant managed Redis and alerts on Redis errors.
 3. **A wrong or zero price raises no error.** LiteLLM prices each request from the model it resolves. For a Bedrock application inference profile, the ARN goes in `model_id` and the base model in `model`. The docs note that "LiteLLM cannot tell from the ARN which model it fronts", and they do not say how cost is computed for an ARN ([LiteLLM Bedrock provider](https://docs.litellm.ai/docs/providers/bedrock)). With `LITELLM_OFFLINE_MODE=true` ([§2.5](#25-japan-data-residency-applies-to-every-design)), the price map is the one built into the image, so a newly onboarded model has a price only if the image has one or we configure custom pricing. A budget that is fed a zero cost never trips, and that looks the same as a budget that is working. Gate V-4 ([§2.10](#210-launch-gates-verify-before-production)) checks every deployment, including requests that use prompt caching, because cache reads and writes are priced differently from other input tokens.
 4. **The budget is checked before a request, but its cost is known only after it.** Every request that starts while the caller is under budget runs to completion, so parallel requests can overshoot. The overshoot is bounded by the concurrent requests allowed per user or key, multiplied by the most expensive request allowed (`max_tokens` and the input size limit at the model's price). Set both limits deliberately, and write the resulting bound into the budget policy that finance signs off.
-5. **Clients can influence logging and attribution.** A request body containing `no-log=True` turns off "all tracking/logging" for that request unless `global_disable_no_log_param: true` is set ([logging](https://docs.litellm.ai/docs/proxy/logging)). The docs do not say whether that includes spend tracking, so set the parameter and test it (V-6). Also test whether request-body tags or the OpenAI `user` field change what the spend log attributes, and which team is charged when a token carries more than one `llm-team-*` group (V-7).
+5. **Clients can influence logging and attribution.** A request body containing `no-log=True` turns off "all tracking/logging" for that request unless `global_disable_no_log_param: true` is set ([logging](https://docs.litellm.ai/docs/proxy/logging)). The docs do not say whether that includes spend tracking, so set the parameter and test it (V-6). Also test whether request-body tags or the OpenAI `user` field change what the spend log attributes, and which team is charged when a key's owner is in more than one `llm-team-*` team (V-7).
 6. **Unfinished requests.** Requests also end before the response completes: a client disconnects, a timeout fires, or a task stops. The docs checked for this design do not say how those requests are metered, either by LiteLLM or by the provider. Gate V-5 compares the provider's usage with LiteLLM's spend logs for cancelled streams. Any gap is cost that no team is charged for ([§4.5](03-aws.md#45-cost-allocation--token-controls-aws)).
 
 ## 2.5 Japan data residency (applies to every design)
@@ -238,7 +265,7 @@ flowchart TB
 
 **LiteLLM-specific residency settings:**
 
-- Set `LITELLM_OFFLINE_MODE=true`. This stops the default calls to `raw.githubusercontent.com` (model cost map and other files) and the release check, and the egress firewall denies the rest ([outbound requests](https://docs.litellm.ai/docs/proxy/outbound_requests)). The enterprise license check can still contact `license.litellm.ai` if the key cannot be verified locally. That call carries the license key, not prompts; allowlist it or confirm offline licensing with the vendor. Also test what happens when a task starts while that endpoint cannot be reached (V-9). JWT auth and SSO are enterprise features [A-6]. If they turn off when the check fails, an egress incident becomes a full outage at the next task restart.
+- Set `LITELLM_OFFLINE_MODE=true`. This stops the default calls to `raw.githubusercontent.com` (model cost map and other files) and the release check, and the egress firewall denies the rest ([outbound requests](https://docs.litellm.ai/docs/proxy/outbound_requests)). The enterprise license check can still contact `license.litellm.ai` if the key cannot be verified locally. That call carries the license key, not prompts; allowlist it or confirm offline licensing with the vendor. Also test what happens when a task starts while that endpoint cannot be reached (V-9). SSO is an enterprise feature [A-6]. If it turns off when the check fails, users cannot sign in to the Admin UI or create keys after the next task restart. API requests with existing virtual keys do not use SSO; V-9 checks whether anything else they need turns off.
 - Use only logging callbacks whose destinations are in Japan, such as S3, GCS, or Azure Blob in a Japanese region, or self-hosted Langfuse in the same VPC. **SaaS observability or alerting destinations are not allowed** unless they are hosted in Japan. Budget alerts go by email or Teams/Slack, and the alert text must contain no prompt content.
 - Router fallbacks may point only to other Japan-processing deployments. A fallback to a `global.` profile or a public API would silently break residency.
 - Image URLs in prompts make LiteLLM (and Bedrock) fetch the image from wherever it is hosted ([outbound requests](https://docs.litellm.ai/docs/proxy/outbound_requests)). The egress allowlist blocks arbitrary fetches, so clients must send images inline (base64).
@@ -251,7 +278,7 @@ All users are on the corporate network [A-13]. There are two ways for them to re
 |---|---|---|
 | Path | Office or DC internet breakout → internet → regional load balancer in Tokyo | Corporate network → DC → Direct Connect / ExpressRoute / Interconnect → internal load balancer in Tokyo |
 | Load balancer | Internet-facing, reachable only from our office and DC egress IPs (security group, NSG, or Cloud Armor allowlist, repeated in the WAF) | Internal only; allows the corporate address ranges |
-| Identity and device checks | Entra token (or virtual key), plus the Intune certificate (mTLS) if adopted ([§2.3](#23-authentication-modes-for-litellm-api-traffic)) | The same |
+| Identity and device checks | Virtual key ([§2.3](#23-authentication-modes-for-litellm-api-traffic)). The allowlist stands in for the device check while [A-16] holds; the Intune certificate (mTLS) only where [§2.3.2](#232-what-mtls-checks-at-the-load-balancer) requires it. | The same. The internal load balancer admits the corporate ranges, so [A-16] matters in the same way. |
 | Encryption | TLS end to end, laptop → load balancer | The same TLS. The circuit carries it unchanged and adds no encryption of its own. |
 | Depends on | The office proxy's TLS-inspection exemption and stable egress IPs [A-14, A-15] | Carrier contract and bandwidth, DC routing, DNS forwarding, and the cloud hub (TGW, ER gateway, Cloud Router) |
 | Status | Build first | Build only on a trigger in [§8.0](07-private-connectivity.md#80-when-route-a-is-worth-adopting) |
@@ -270,7 +297,7 @@ Both routes can run at the same time. A load balancer is either internet-facing 
 
 **Office network prerequisites [A-14, A-15]:**
 
-- Exempt `llm.corp.example` from TLS inspection on the corporate proxy. Inspection replaces the laptop's TLS connection with the proxy's own, so the client certificate never reaches the load balancer (mTLS breaks), and the proxy can read every prompt, token, and key.
+- Exempt `llm.corp.example` from TLS inspection on the corporate proxy. Inspection replaces the laptop's TLS connection with the proxy's own, so the proxy can read every prompt and every virtual key, and may log them ([§2.3.6](#236-threats-each-authentication-option-blocks), row 9). It would also stop the client certificate from reaching the load balancer if mTLS becomes required.
 - Allow `llm.corp.example` in the outbound firewall by FQDN. If the firewall can only allow fixed destination IPs: Azure and GCP load balancers already have static frontend IPs. AWS ALB addresses change over time, so put **AWS Global Accelerator** in front of the ALB. It gives static anycast IPs, passes the encrypted TCP stream through unchanged, and preserves the client IP for the allowlist ([client IP preservation](https://docs.aws.amazon.com/global-accelerator/latest/dg/preserve-client-ip-address.html)). Alternatively, use Route A.
 
 ## 2.7 WAF tuning and timeouts for LLM traffic
@@ -319,32 +346,31 @@ Restrict read access to the LiteLLM database, the log stores, and the admin UI, 
 
 ## 2.9 Access scenarios and checkpoints
 
-Six scenarios cover how people reach the gateway and the cloud account behind it. Each one has a sign-in step and a later "every request" step. Whatever is checked only at sign-in is not checked again until the credential that sign-in produced expires.
+Five scenarios cover how people reach the gateway and the cloud account behind it. Each one has a sign-in step and a later "every request" step. Whatever is checked only at sign-in is not checked again until the credential that sign-in produced expires. Workloads (agents, apps, CI) use service-account keys with network scoping ([§2.3](#23-authentication-modes-for-litellm-api-traffic)); they have no sign-in step.
 
 | ID | Who | What | Credential left after sign-in | Lifetime |
 |---|---|---|---|---|
-| **U1** | User | LiteLLM dashboard in a browser | LiteLLM session cookie | LiteLLM session setting |
-| **U2** | User | API with an Entra token: Claude Code, Codex CLI, SDKs (default) | Entra access token | 60–90 min, renewed automatically |
-| **U3** | User | API with a virtual key: IDE plugins and tools that only take a pasted key (fallback) | LiteLLM virtual key | 30–90 days |
+| **U1** | User | LiteLLM dashboard in a browser, including creating and renewing their personal key | LiteLLM session cookie | LiteLLM session setting |
+| **U2** | User | API with a personal virtual key: Claude Code, Codex CLI, IDE plugins, SDKs | LiteLLM virtual key | 30–90 days |
 | **A1** | Admin | LiteLLM dashboard as `proxy_admin` | Session cookie with the admin role | Re-sign-in every 4–8 h (CA-GW-02) |
 | **A2** | Admin | Cloud console (AWS console through IAM Identity Center; Azure portal; Google Cloud console) | Portal session + console session | 1 h for admin permission sets (12 h maximum on AWS) |
 | **A3** | Admin | Cloud CLI (`aws sso login`, `az login`, `gcloud auth login`) | Temporary credentials cached on disk | Same as A2 |
 
-**Checkpoints.** IDs are referenced in the flows below and in the cloud designs. *Recommended option* and *proposed* mark controls that are not yet in every design.
+**Checkpoints.** IDs are referenced in the flows below and in the cloud designs. *Conditional* and *proposed* mark controls that are not yet in every design.
 
 | ID | Where | What it checks | Status |
 |---|---|---|---|
 | E1 | Entra | Primary sign-in (password, Windows Hello for Business, passkey) | In design |
 | E2 | Entra | MFA through Okta EAM; phishing-resistant for admins (CA-GW-02) | In design |
-| E3 | Entra | Intune-compliant device (CA-GW-01). Runs only when a token or session is issued. | In design |
+| E3 | Entra | Intune-compliant device (CA-GW-01). Runs only at sign-in, when a session starts (and so when a key is created). | In design |
 | E4 | Entra | Named location: office and DC egress IPs only, for operator apps (CA-GW-05) | Proposed |
 | E5 | Entra | Sign-in frequency (4–8 h for admins) | In design |
 | E6 | Entra | Device-code flow blocked (CA-GW-04 for `litellm-prod`; CA-GW-05 for operator apps) | In design / proposed |
-| N1 | WAF + LB | Source IP is an office or DC egress IP [A-14] | In design |
-| N2 | LB | mTLS: certificate from the Intune CA, TPM key possession, CRL ([§2.3.2](#232-what-mtls-checks-at-the-load-balancer)) | Recommended option |
+| N1 | WAF + LB | Source IP is an office or DC egress IP [A-14]. Implies a managed device only while [A-16] holds (gate V-11). | In design |
+| N2 | LB | mTLS: certificate from the Intune CA, TPM key possession, CRL ([§2.3.2](#232-what-mtls-checks-at-the-load-balancer)) | Conditional: only if [A-16] fails or remote access is added |
 | N3 | WAF | Stricter rules on `/ui`, `/sso`, `/key/*` | In design |
 | G1 | LiteLLM | SSO callback: ID token valid; app role → role, groups → teams | In design |
-| G2 | LiteLLM | Credential: session cookie, JWT (signature, `aud`, `exp`), or virtual key (exists, not expired, not blocked) | In design |
+| G2 | LiteLLM | Credential: session cookie, or virtual key (exists, not expired, not blocked) | In design |
 | G3 | LiteLLM | Role, team, allowed models, budget, TPM/RPM | In design |
 | G4 | LiteLLM | Audit log: spend per request, key/team/budget changes | In design |
 | C1 | Cloud IdP | IAM Identity Center / Azure / Workforce Identity Federation accepts the Entra assertion; user provisioned by SCIM | In design |
@@ -353,41 +379,41 @@ Six scenarios cover how people reach the gateway and the cloud account behind it
 | C4 | Cloud IAM | Short admin sessions (1 h permission sets; PIM activation windows) | Proposed |
 | C5 | Cloud audit | CloudTrail, Activity Log, Cloud Audit Logs | In design |
 
-**Flows** (`[ ]` = checkpoint; *opt* = recommended option):
+**Flows** (`[ ]` = checkpoint; *cond* = only if mTLS is required):
 
 | ID | Sign-in | Every later request |
 |---|---|---|
-| U1 | Browser → LB [N1, N3, N2 *opt*] → LiteLLM `/ui` → Entra [E1, E2, E3, E5] → LiteLLM callback [G1] | Browser (cookie) → LB [N1, N3, N2 *opt*] → LiteLLM [G2, G3, G4] |
-| U2 | CLI token command → MSAL with OS broker → Entra [E1, E2, E3, E5, E6]; E3 is re-checked on every refresh | CLI (`Authorization: Bearer`) → LB [N1, N2 *opt*] → LiteLLM [G2, G3, G4] → model |
-| U3 | Created once through U1, then `/key/generate` [G3] (owner = UPN, expiry set) | Tool (`x-api-key`) → LB [N1, N2 *opt*] → LiteLLM [G2, G3, G4] → model. **No Entra checkpoint.** |
-| A1 | Browser → LB [N1, N3, N2 *opt*] → Entra CA-GW-02 [E1, E2, E3, E4, E5] → LiteLLM callback [G1] | Browser → LB [N1, N3, N2 *opt*] → LiteLLM admin routes [G2, G3, G4] |
+| U1 | Browser → LB [N1, N3, N2 *cond*] → LiteLLM `/ui` → Entra [E1, E2, E3, E5] → LiteLLM callback [G1] | Browser (cookie) → LB [N1, N3, N2 *cond*] → LiteLLM [G2, G3, G4] |
+| U2 | Created through U1, then `/key/generate` within the upper bounds [G3] (owner = UPN, expiry set); stored with the key helper. Renewed the same way. | CLI or tool (`x-api-key` or `Authorization: Bearer`) → LB [N1, N2 *cond*] → LiteLLM [G2, G3, G4] → model. **No Entra checkpoint.** |
+| A1 | Browser → LB [N1, N3, N2 *cond*] → Entra CA-GW-02 [E1, E2, E3, E4, E5] → LiteLLM callback [G1] | Browser → LB [N1, N3, N2 *cond*] → LiteLLM admin routes [G2, G3, G4] |
 | A2 | Browser → cloud access portal → Entra CA-GW-05 [E1, E2, E3, E4, E5] → cloud IdP [C1, C2] → console session [C4] | Each console action is an API call [C3, C5]. **No N1:** the console is on the public internet. |
 | A3 | CLI login → browser on the same machine → same sign-in as A2 [+ E6] | Each CLI command (signed with cached credentials) [C3, C5] |
 
 **What the flows show:**
 
-1. **The device is checked only at sign-in (E3).** After that, every scenario relies on a bearer credential that nobody re-checks. U2 is the exception that shrinks the gap: Entra re-runs CA on every token refresh, about hourly.
-2. **U3 is the weakest path.** A virtual key lasts 30–90 days and is never seen by Entra again. N1 limits it to our network; only N2 stops it on an unmanaged device inside that network [A-16].
+1. **The device is checked only at sign-in (E3).** After that, every scenario relies on a bearer credential that nobody re-checks against Entra.
+2. **U2 relies on the network.** A virtual key lasts up to 90 days and is never seen by Entra again. N1 limits it to our network, and [A-16] limits that network to managed devices; gate V-11 tests this before launch. If [A-16] cannot be confirmed, N2 becomes required ([§2.3.2](#232-what-mtls-checks-at-the-load-balancer), [§2.3.6](#236-threats-each-authentication-option-blocks)).
 3. **A2 and A3 have no gateway in front of them.** Operator access to the cloud account is the most powerful path in the whole design, so it needs E4 at sign-in and the source-IP condition in C3 on every call. Neither exists on the cloud side by default.
 4. **A3 leaves credentials on disk.** Anyone who copies the CLI cache can use it until the session ends, so keep admin sessions at 1 h (C4). On AWS, `aws sso login` uses a browser on the same machine by default; `--use-device-code` lets the sign-in happen on one machine and the credentials land on another, and CA-GW-04 does not cover IAM Identity Center. Block device-code flow on the operator apps (CA-GW-05) where the cloud supports it, and rely on C3 where it does not.
 5. **A1 should be mostly read-only.** Production changes to keys, teams, and budgets go through IaC and CI ([§2.3](#23-authentication-modes-for-litellm-api-traffic)).
 
 ## 2.10 Launch gates: verify before production
 
-Several controls in this design depend on product behaviour that the vendor documentation either does not cover or covers only in part. These gates replace assumptions with tests. Each one runs against the pinned LiteLLM version and the production configuration, and is repeated after every LiteLLM upgrade. A gate that fails blocks launch, or the next upgrade, until the design is changed.
+Several controls in this design depend on product behaviour that the vendor documentation either does not cover or covers only in part, or on facts about our own network. These gates replace assumptions with tests. Each one runs against the pinned LiteLLM version and the production configuration, and is repeated after every LiteLLM upgrade. A gate that fails blocks launch, or the next upgrade, until the design is changed.
 
 | ID | Gate | How to test | Pass condition |
 |---|---|---|---|
 | V-1 | No prompt content outside the approved stores ([§2.8](#28-who-can-see-prompts)) | Send requests containing a unique canary string through every model and every API style, plus one that a guardrail blocks and one that the provider rejects. Search every store for the canary: spend logs, error logs, the S3/callback bucket, container logs, Redis, guardrail logs, and the SIEM. | No hits outside the opt-in content store. Run this **before** retention locks (for example S3 Object Lock) are enabled on any log bucket. |
-| V-2 | Users cannot create virtual keys ([§2.3.5](#235-key-issuance-the-master-key-and-allowlisted-workloads)) | Call `/key/generate` with an `internal_user` Entra token, and through the UI as that user. | Refused. |
+| V-2 | Key creation stays within its limits ([§2.3.5](#235-key-issuance-the-master-key-and-allowlisted-workloads)) | As an `internal_user`, in the UI and through `/key/generate`, try to create a key above each upper bound (duration, budget, TPM/RPM), a key for another user or team, and a key with admin permissions. Also create two keys and check that the user-level limits apply across both. | Every attempt is refused, and the user-level limits cover all of the user's keys. |
 | V-3 | Admin UI master-key login ([§2.3.5](#235-key-issuance-the-master-key-and-allowlisted-workloads)) | Find out whether password login on `/ui` can be turned off while SSO is on. | Turned off, or the residual risk is accepted in writing. |
 | V-4 | Spend is correct per deployment ([§2.4](#24-litellm-tenancy-model-same-on-all-clouds)) | For each deployment (including application inference profile ARNs), send requests with and without prompt caching, and compare the spend log's tokens and cost with the provider's price list. | Non-zero, and within an agreed tolerance. |
 | V-5 | Cancelled requests are metered ([§2.4](#24-litellm-tenancy-model-same-on-all-clouds)) | Cancel streams mid-response (client disconnect, and a timeout). Compare the provider's usage (for Bedrock, its CloudWatch token metrics) with LiteLLM's spend logs. | The gap is measured and has a named owner in the chargeback model. |
 | V-6 | Clients cannot skip tracking ([§2.4](#24-litellm-tenancy-model-same-on-all-clouds)) | Send `no-log=True` with `global_disable_no_log_param: true` set. | A spend log row is still written. |
-| V-7 | Clients cannot choose who pays ([§2.4](#24-litellm-tenancy-model-same-on-all-clouds)) | Send requests with request-body tags and the `user` field, and with a token for a user in two `llm-team-*` groups. | The charged team and tags are the ones the platform assigns, or the client-set fields are documented as showback-only. |
-| V-8 | Database outage behaviour | Fail over the database during load, with JWT and virtual-key callers. Record what fails and for how long. LiteLLM's `allow_requests_on_db_unavailable` changes this behaviour, and its docs recommend `true` only for deployments that cannot be reached from the public internet ([production guide](https://docs.litellm.ai/docs/proxy/prod)); Route B is internet-facing. | Behaviour is known, and the on-call runbook matches it. |
-| V-9 | Licence check unavailable ([§2.5](#25-japan-data-residency-applies-to-every-design)) | Block the licence endpoint and restart a task. | JWT auth and SSO still work, or the endpoint is treated as a production dependency with monitoring. |
-| V-10 | Identity endpoints unavailable | Block egress to Entra from the gateway and keep sending JWT requests. Record how long validation keeps working on cached signing keys. | Behaviour is known, and egress for the gateway is monitored as a production dependency. |
+| V-7 | Clients cannot choose who pays ([§2.4](#24-litellm-tenancy-model-same-on-all-clouds)) | Send requests with request-body tags and the `user` field, and with the key of a user who is in two `llm-team-*` teams. | The charged team and tags are the ones the platform assigns, or the client-set fields are documented as showback-only. |
+| V-8 | Database outage behaviour | Fail over the database during load, with virtual-key callers. Keys are checked against the database through a cache, so record what fails, for how long, and whether new or recently revoked keys behave differently. LiteLLM's `allow_requests_on_db_unavailable` changes this behaviour, and its docs recommend `true` only for deployments that cannot be reached from the public internet ([production guide](https://docs.litellm.ai/docs/proxy/prod)); Route B is internet-facing. | Behaviour is known, and the on-call runbook matches it. |
+| V-9 | Licence check unavailable ([§2.5](#25-japan-data-residency-applies-to-every-design)) | Block the licence endpoint and restart a task. Send API requests with virtual keys, and sign in to the Admin UI. | API requests and SSO still work, or the endpoint is treated as a production dependency with monitoring. |
+| V-10 | Identity endpoints unavailable | Block egress to Entra and Graph from the gateway. Keep sending API requests with virtual keys, and try to sign in to the Admin UI. | API requests keep working. Sign-in and team sync fail with a clear error and raise an alert. |
+| V-11 | Unmanaged devices cannot reach the gateway ([A-16], [§2.3.6](#236-threats-each-authentication-option-blocks)) | From each office and DC, connect to `llm.corp.example` from a guest Wi-Fi device, a BYOD device, an unauthenticated LAN port, and any VPN pool that admits unmanaged devices. List every CIDR on the allowlist and its owner. Repeat after every change to egress NAT, guest networks, or the allowlist. | Every connection is refused at N1, and every CIDR is a dedicated egress of ours (no shared SASE or cloud NAT ranges). If any connection succeeds, mTLS becomes required ([§2.3.2](#232-what-mtls-checks-at-the-load-balancer)). |
 
 
 ---

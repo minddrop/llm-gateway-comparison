@@ -1,6 +1,6 @@
 # 4. ステップ 2a: AWS 設計
 
-**ベースライン:** AWS サンプル [sample-litellm-bedrock-gateway-on-eks](https://github.com/aws-samples/sample-litellm-bedrock-gateway-on-eks)（[§3.1](02-reference-architectures.md#31-aws)）の ECS Fargate モード（サンプルの既定は EKS）を使い、その L1 + L2 層（VPC エンドポイント経由の Bedrock）を採用する。デプロイ先は **アジアパシフィック（東京）`ap-northeast-1`**、DR リージョンは **アジアパシフィック（大阪）`ap-northeast-3`** とする。ゲートウェイは **経路 B**（[§2.6](01-common-design.md#26-接続経路モデル全設計に適用)）で公開する。インターネット向け ALB のセキュリティ グループと WAF は当社のオフィスと DC の送信元 IP だけを許可し、LiteLLM で Entra JWT を確認する。推奨オプションとして Intune 証明書による mTLS も確認する。すべて東京で終端する。**経路 A** は任意で、ステップ 4（[§8.2](07-private-connectivity.md#82-aws-direct-connect-オーバーレイ)）で Direct Connect 経由の内部 ALB を追加する。[§2.5](01-common-design.md#25-日本国内データ所在全設計に適用) の日本国内所在ルールを全体に適用する。
+**ベースライン:** AWS サンプル [sample-litellm-bedrock-gateway-on-eks](https://github.com/aws-samples/sample-litellm-bedrock-gateway-on-eks)（[§3.1](02-reference-architectures.md#31-aws)）の ECS Fargate モード（サンプルの既定は EKS）を使い、その L1 + L2 層（VPC エンドポイント経由の Bedrock）を採用する。デプロイ先は **アジアパシフィック（東京）`ap-northeast-1`**、DR リージョンは **アジアパシフィック（大阪）`ap-northeast-3`** とする。ゲートウェイは **経路 B**（[§2.6](01-common-design.md#26-接続経路モデル全設計に適用)）で公開する。インターネット向け ALB のセキュリティ グループと WAF は当社のオフィスと DC の送信元 IP だけを許可し、LiteLLM で仮想キーを確認する（Intune 証明書による mTLS は [§2.3.2](01-common-design.md#232-ロード-バランサーで-mtls-が確認すること) で必須になる場合だけ追加する）。すべて東京で終端する。**経路 A** は任意で、ステップ 4（[§8.2](07-private-connectivity.md#82-aws-direct-connect-オーバーレイ)）で Direct Connect 経由の内部 ALB を追加する。[§2.5](01-common-design.md#25-日本国内データ所在全設計に適用) の日本国内所在ルールを全体に適用する。
 
 ## 4.1 アーキテクチャ図（AWS）
 
@@ -40,7 +40,7 @@ flowchart LR
     subgraph ACCT["AWS ワークロード アカウント: llm-gateway-prod（ap-northeast-1 東京、3 AZ、DR: ap-northeast-3 大阪）"]
         direction TB
         subgraph PUB["パブリック サブネット"]
-            ALB["インターネット向け ALB（HTTPS、TLS 1.2+）<br/>SG: オフィス/DC の送信元 IP のみ<br/>mTLS 検証（推奨オプション）<br/>（トラスト ストア + CRL）<br/>アイドル タイムアウト 600 秒、ACM 証明書"]
+            ALB["インターネット向け ALB（HTTPS、TLS 1.2+）<br/>SG: オフィス/DC の送信元 IP のみ<br/>mTLS 検証（必須の場合のみ）<br/>（トラスト ストア + CRL）<br/>アイドル タイムアウト 600 秒、ACM 証明書"]
         end
         subgraph APP["プライベート アプリ サブネット"]
             ECS["ECS Fargate サービス<br/>LiteLLM Proxy + UI<br/>（+ Bedrock ミドルウェア）<br/>3 AZ にタスクを分散"]
@@ -48,7 +48,7 @@ flowchart LR
         end
         subgraph DATA["プライベート データ サブネット"]
             AUR[("Aurora PostgreSQL<br/>マルチ AZ<br/>キー、チーム、予算、利用額")]
-            REDIS[("ElastiCache Valkey/Redis<br/>マルチ AZ<br/>レート制限・予算カウンター、キャッシュ")]
+            REDIS[("ElastiCache Valkey/Redis<br/>マルチ AZ<br/>レート制限・予算カウンター<br/>（応答キャッシュなし）")]
         end
         subgraph EP["エンドポイント サブネット（PrivateLink）"]
             VPCE["インターフェイス エンドポイント:<br/>bedrock-runtime、bedrock、<br/>secretsmanager、kms、logs、sts、<br/>ecr.api/dkr、sagemaker.runtime<br/>+ S3 ゲートウェイ エンドポイント"]
@@ -91,10 +91,10 @@ flowchart LR
     ECS -->|"L6b トークン交換、JWKS、Graph<br/>（送信許可リスト経由）"| NFW
 
     %% ---------- API フロー ----------
-    U -->|"1 HTTPS + Entra JWT またはキー<br/>（+ Intune 証明書）<br/>（オフィスのブレイクアウト IP）"| R53
+    U -->|"1 HTTPS + 仮想キー<br/>（+ Intune 証明書）<br/>（オフィスのブレイクアウト IP）"| R53
     R53 -->|"2 名前解決"| CF
     CF -->|"3 IP 許可リスト、マネージド + レート ルール"| ALB
-    AGT -->|"1a DC のブレイクアウト IP<br/>（+ ワークロード証明書）"| R53
+    AGT -->|"1a サービス アカウント用キー<br/>DC のブレイクアウト IP<br/>（+ ワークロード証明書）"| R53
     ALB -->|"4 転送（mTLS 採用時は検証後）"| ECS
     ECS <-->|"5 認証、予算、TPM/RPM チェック"| REDIS
     ECS <-->|"5 キー / チーム / 予算の参照"| AUR
@@ -124,7 +124,7 @@ flowchart LR
     IDC -->|"A2/A3 一時的なロールの資格情報"| IAM
 ```
 
-> **図の表記**（AWS ガイダンスの図のスタイルに合わせている）: 実線の矢印は番号付きステップのリクエスト経路、点線の矢印は補助・非同期・バッチのフローを表す。**L ステップ** はログイン フロー（[§2.2](01-common-design.md#22-共通ログイン-フローシーケンス)）、**数字のステップ** は API リクエスト フロー（[§4.3](#43-リクエスト-フローの説明aws)）、**A2/A3** は運用者のシナリオ（[§2.9](01-common-design.md#29-アクセス-シナリオとチェックポイント)）である。Intune 証明書のように括弧で囲んだ項目は、mTLS を採用する場合にだけ適用される。
+> **図の表記**（AWS ガイダンスの図のスタイルに合わせている）: 実線の矢印は番号付きステップのリクエスト経路、点線の矢印は補助・非同期・バッチのフローを表す。**L ステップ** はログイン フロー（[§2.2](01-common-design.md#22-共通ログイン-フローシーケンス)）、**数字のステップ** は API リクエスト フロー（[§4.3](#43-リクエスト-フローの説明aws)）、**A2/A3** は運用者のシナリオ（[§2.9](01-common-design.md#29-アクセス-シナリオとチェックポイント)）である。Intune 証明書のように括弧で囲んだ項目は、mTLS が必須になった場合にだけ適用される（[§2.3.2](01-common-design.md#232-ロード-バランサーで-mtls-が確認すること)）。
 
 ## 4.2 コンポーネント表（AWS）
 
@@ -132,10 +132,10 @@ flowchart LR
 |---|---|---|---|---|
 | 1 | [Route 53](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/Welcome.html)（パブリック + プライベート ホストゾーン、Resolver エンドポイント） | `llm.corp.example` の DNS。オンプレミス クライアント向けのスプリット ホライズン名前解決は経路 A を採用する場合のみ | Azure DNS + DNS Private Resolver | Cloud DNS（+ 受信サーバー ポリシー） |
 | 2 | [AWS WAF](https://docs.aws.amazon.com/waf/latest/developerguide/waf-chapter.html)（ALB 上のリージョン Web ACL）+ Shield Standard。[CloudFront](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/Introduction.html) は使 **わない**。 | オフィス/DC の IP 許可リスト（セキュリティ グループと重ねる）、LLM の本文向けに調整したマネージド ルール グループ（[§2.7](01-common-design.md#27-llm-トラフィック向けの-waf-調整とタイムアウト)）、レートベース ルール、DDoS 対策。TLS は東京でのみ終端する。 | App Gateway WAF（Front Door なし） | リージョン外部 ALB 上の Cloud Armor |
-| 3 | [Application Load Balancer](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/introduction.html)（[mTLS 検証モード](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/mutual-authentication.html)） | LiteLLM への L7 ルーティング。セキュリティ グループはオフィス/DC の送信元 CIDR だけを許可する（サンプルの `allowlist-explicit` モード）。推奨オプション: トラスト ストアによる Intune 証明書とワークロード証明書の検証（[§2.3.2](01-common-design.md#232-ロード-バランサーで-mtls-が確認すること)）。 | Application Gateway v2（mTLS） | 外部/内部アプリケーション LB（mTLS） |
+| 3 | [Application Load Balancer](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/introduction.html)（[mTLS 検証モード](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/mutual-authentication.html)） | LiteLLM への L7 ルーティング。セキュリティ グループはオフィス/DC の送信元 CIDR だけを許可する（サンプルの `allowlist-explicit` モード）。mTLS が必須の場合だけ: トラスト ストアによる Intune 証明書とワークロード証明書の検証（[§2.3.2](01-common-design.md#232-ロード-バランサーで-mtls-が確認すること)）。 | Application Gateway v2（mTLS） | 外部/内部アプリケーション LB（mTLS） |
 | 4 | [ECS on Fargate](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/AWS_Fargate.html)（代替: EKS） | LiteLLM Proxy、UI、Bedrock ミドルウェアを実行する。ステートレスで自動スケール。 | Azure Container Apps（代替: AKS） | Cloud Run（代替: GKE Autopilot） |
 | 5 | [Aurora PostgreSQL](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/Aurora.AuroraPostgreSQL.html) マルチ AZ（EKS サンプルは Aurora Serverless v2 を使用。プロビジョンドと Serverless v2 のどちらでもよい） | LiteLLM DB: ユーザー、チーム、キー、予算、利用額ログ | Azure Database for PostgreSQL Flexible Server（ゾーン冗長 HA） | Cloud SQL for PostgreSQL（HA）/ AlloyDB |
-| 6 | [ElastiCache（Valkey/Redis OSS）](https://docs.aws.amazon.com/AmazonElastiCache/latest/dg/WhatIs.html) マルチ AZ | タスク間で共有する TPM/RPM 制限と予算のカウンター、応答キャッシュ | Azure Managed Redis | Memorystore for Valkey / Redis Cluster |
+| 6 | [ElastiCache（Valkey/Redis OSS）](https://docs.aws.amazon.com/AmazonElastiCache/latest/dg/WhatIs.html) マルチ AZ | タスク間で共有する TPM/RPM 制限と予算のカウンター。応答キャッシュは使わない（[§2.8](01-common-design.md#28-プロンプトを見られるのは誰か)）。 | Azure Managed Redis | Memorystore for Valkey / Redis Cluster |
 | 7 | [`jp.` 地理的推論プロファイル](https://docs.aws.amazon.com/bedrock/latest/userguide/geographic-cross-region-inference.html) と In-Region モデルを使う [Amazon Bedrock](https://docs.aws.amazon.com/bedrock/latest/userguide/what-is-bedrock.html)（+ それらから作成する [アプリケーション推論プロファイル](https://docs.aws.amazon.com/bedrock/latest/userguide/inference-profiles-create.html)） | 日本国内で処理されるネイティブの基盤モデル（[§2.5](01-common-design.md#25-日本国内データ所在全設計に適用) のスナップショット参照）と、チャージバック用のタグ付きプロファイル | Japan East の Azure OpenAI Standard デプロイ | Vertex AI の `asia-northeast1` リージョン エンドポイント |
 | 8 | ECS 上の VPC 内ガードレール サービス: [Presidio による PII マスキング](https://docs.litellm.ai/docs/proxy/guardrails/pii_masking_v2) と、日本語対応のプロンプト攻撃分類器（セルフホスト。東京の SageMaker AI でも可）。[Bedrock Guardrails](https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails.html) は、日本国内に閉じるガードレール プロファイルが提供された場合にのみ使う（[§2.5](01-common-design.md#25-日本国内データ所在全設計に適用)）。 | PII の秘匿化、プロンプト攻撃・ジェイルブレイクの検出、コンテンツ ポリシー。LiteLLM から呼び出す | Azure AI Content Safety / Prompt Shields（Japan East） | Model Armor（`asia-northeast1`） |
 | 9 | [SageMaker AI](https://docs.aws.amazon.com/sagemaker/latest/dg/whatis.html) | 任意: セルフホストまたはファインチューニング済みモデル | Foundry マネージド コンピューティング / AML オンライン エンドポイント | Vertex AI エンドポイント / GKE |
@@ -159,16 +159,16 @@ flowchart LR
 
 **API リクエスト:**
 
-1. **クライアント → DNS。** オフィスにある Intune 管理ノート PC 上の Claude Code、Codex CLI、SDK、チャット UI が、トークン コマンドで得た **Entra JWT** を付けて `https://llm.corp.example/v1/messages`、`/v1/responses`、または `/v1/chat/completions` を呼び出す。貼り付けたキーしか受け付けない IDE プラグインは代わりに **仮想キー** を送る（[§2.3.4](01-common-design.md#234-コーディング-エージェントのクライアント)）。リクエストはこのホスト名を TLS インスペクションしないオフィスのインターネット ブレイクアウトから出ていく [A-15]。mTLS を採用する場合、クライアントはユーザーの **Intune 発行の証明書** を提示する。オンプレミス DC の AI エージェント（1a）は DC のブレイクアウトから出ていき、mTLS を採用する場合は **ワークロード証明書** を提示する。経路 A の場合は、どちらも Direct Connect を使う（[§8.2](07-private-connectivity.md#82-aws-direct-connect-オーバーレイ)）。
+1. **クライアント → DNS。** オフィスにある Intune 管理ノート PC 上の Claude Code、Codex CLI、IDE プラグイン、SDK が、ユーザーの個人用 **仮想キー** を付けて `https://llm.corp.example/v1/messages`、`/v1/responses`、または `/v1/chat/completions` を呼び出す。Claude Code と Codex CLI はキー ヘルパーを通じて OS のキーチェーンからキーを読み、IDE プラグインは自身の設定からキーを送る（[§2.3.4](01-common-design.md#234-コーディング-エージェントのクライアント)）。リクエストはこのホスト名を TLS インスペクションしないオフィスのインターネット ブレイクアウトから出ていく [A-15]。mTLS を採用する場合、クライアントはユーザーの **Intune 発行の証明書** を提示する。オンプレミス DC の AI エージェント（1a）はチームの **サービス アカウント用キー** を送って DC のブレイクアウトから出ていき、mTLS を採用する場合は **ワークロード証明書** を提示する。経路 A の場合は、どちらも Direct Connect を使う（[§8.2](07-private-connectivity.md#82-aws-direct-connect-オーバーレイ)）。
 2. **Route 53** が ALB の名前を解決する。
-3. **AWS WAF（ALB に関連付けたリージョン Web ACL）** は当社のオフィス/DC の送信元 IP だけを許可する（ALB のセキュリティ グループと重ねる IP セット）。続いて送信元 IP ごとのレート制限、Amazon IP レピュテーション リスト、LLM の本文向けに調整した Core ルール セット（[§2.7](01-common-design.md#27-llm-トラフィック向けの-waf-調整とタイムアウト)）、管理パス向けの厳しいルールを適用する。**設計判断:** EKS サンプルと同様に ALB を唯一の入口とし、CloudFront は使わない（[§2.6](01-common-design.md#26-接続経路モデル全設計に適用)）。CloudFront は現在クライアント証明書を自ら検証できるため、これは mTLS の問題ではない。理由は所在要件（日本に限られない拠点での TLS 終端とエッジ WAF、us-east-1 での WAF 管理）、CloudFront のオリジン タイムアウトが既定 30 秒であること、キャッシュするものがないことである。後から CloudFront を追加することもしない。
+3. **AWS WAF（ALB に関連付けたリージョン Web ACL）** は当社のオフィス/DC の送信元 IP だけを許可する（ALB のセキュリティ グループと重ねる IP セット）。続いて、オフィスのピークを上回る洪水対策の上限として設定した送信元 IP ごとのレート制限（ユーザー単位の制限は LiteLLM が担う、[§2.7](01-common-design.md#27-llm-トラフィック向けの-waf-調整とタイムアウト)）、Amazon IP レピュテーション リスト、LLM の本文向けに調整した Core ルール セット（[§2.7](01-common-design.md#27-llm-トラフィック向けの-waf-調整とタイムアウト)）、管理パス向けの厳しいルールを適用する。**設計判断:** EKS サンプルと同様に ALB を唯一の入口とし、CloudFront は使わない（[§2.6](01-common-design.md#26-接続経路モデル全設計に適用)）。CloudFront は現在クライアント証明書を自ら検証できるため、これは mTLS の問題ではない。理由は所在要件（日本に限られない拠点での TLS 終端とエッジ WAF、us-east-1 での WAF 管理）、CloudFront のオリジン タイムアウトが既定 30 秒であること、キャッシュするものがないことである。後から CloudFront を追加することもしない。
 4. **ALB。** セキュリティ グループはオフィス/DC の送信元 CIDR だけを受け入れ、`0.0.0.0/0` は決して許可しない。mTLS を採用する場合、TLS ハンドシェイクの間に、ALB はクライアント証明書のチェーンをトラスト ストア（Intune が証明書を配布する元の CA とワークロード CA）で検証し、秘密鍵の所持、有効期間、S3 上の CRL を確認する（[§2.3.2](01-common-design.md#232-ロード-バランサーで-mtls-が確認すること)）。また、LiteLLM が証明書のシリアル番号を記録できるよう `X-Amzn-Mtls-Clientcert-*` ヘッダーを転送する。3 AZ の ECS タスクで構成される LiteLLM ターゲット グループにルーティングする。アイドル タイムアウトは 600 秒（[§2.7](01-common-design.md#27-llm-トラフィック向けの-waf-調整とタイムアウト)）。
-5. **LiteLLM の認証・認可。** LiteLLM は、Entra JWT（Entra JWKS による署名検証と `aud`、`iss`、有効期限の確認）か仮想キー（Aurora でのハッシュ照合 + Redis キャッシュ）のいずれかを検証する。証明書のユーザーとトークンやキーの所有者は比較しない（[§2.3.3](01-common-design.md#233-証明書とユーザーの紐付け-採用しない)）。そのうえでユーザー、チーム、組織を特定し、モデル アクセス グループ、キー・ユーザー・チームの **予算**、Redis カウンターによる **TPM/RPM 制限** を確認する。制限超過のリクエストには `429`、予算超過には予算超過エラー付きの `400`/`429` を返す。
+5. **LiteLLM の認証・認可。** LiteLLM は、Aurora でのハッシュ照合（Redis キャッシュ付き）で仮想キーを検証する。キーが存在し、期限切れでなく、ブロックされていないことを確認する。証明書のユーザーとキーの所有者は比較しない（[§2.3.3](01-common-design.md#233-証明書とユーザーの紐付け-採用しない)）。そのうえでユーザー、チーム、組織を特定し、モデル アクセス グループ、キー・ユーザー・チームの **予算**、Redis カウンターによる **TPM/RPM 制限** を確認する。制限超過のリクエストには `429`、予算超過には予算超過エラー付きの `400`/`429` を返す。
 6. **ガードレール（呼び出し前）。** LiteLLM は東京の ECS 上の **VPC 内ガードレール サービス**（PII マスキング用の Presidio と、日本語を扱えるセルフホストのプロンプト攻撃分類器）を呼び出す。日本語のコンテンツには Bedrock Guardrails を使 *わない*。Standard 階層は `apac` ガードレール プロファイル経由でチェックをルーティングし、Classic 階層は日本語に対応していないためである（[§2.5](01-common-design.md#25-日本国内データ所在全設計に適用)）。
-7. **ネイティブ モデル。** LiteLLM は ECS の **タスク IAM ロール**（[タスク ロール](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task-iam-roles.html)）を使い、静的キーなしで **インターフェイス VPC エンドポイント** 経由で `bedrock-runtime` を呼び出す。モデル ID には **チームのアプリケーション推論プロファイル ARN** を使う。このプロファイルは **`jp.` のシステム定義プロファイル**（または In-Region モデル）をコピーして作成するため、Bedrock の利用量に `CostCenter`/`Team` タグが付き、リクエストは東京か大阪でのみ処理される。エンドポイント ポリシーとタスク ロールのポリシーでは、これらの ARN だけを許可する。誰かが LiteLLM の設定に `global.*` や `apac.*` のプロファイルを追加しても、SCP がブロックする。
+7. **ネイティブ モデル。** LiteLLM は ECS の **タスク IAM ロール**（[タスク ロール](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task-iam-roles.html)）を使い、静的キーなしで **インターフェイス VPC エンドポイント** 経由で `bedrock-runtime` を呼び出す。モデル ID には **チームのアプリケーション推論プロファイル ARN** を使う。このプロファイルは **`jp.` のシステム定義プロファイル**（または In-Region モデル）をコピーして作成するため、Bedrock の利用量に `CostCenter`/`Team` タグが付き、リクエストは東京か大阪でのみ処理される。エンドポイント ポリシーとタスク ロールのポリシーでは、これらの ARN だけを許可する。誰かが LiteLLM の設定に `global.*` や `apac.*` のプロファイルを追加しても、SCP がブロックする。LiteLLM の設定では、ARN を `model_id` に、基盤モデルを `model` に設定する（[LiteLLM Bedrock プロバイダー](https://docs.litellm.ai/docs/providers/bedrock)）。ARN の場合のコストの計算方法はドキュメントに書かれていないので、各チームが使い始める前に、すべてのプロファイルが V-4（[§2.10](01-common-design.md#210-ローンチ-ゲート-本番前に検証する)）に合格しなければならない。
 8. **日本リージョンの他バックエンド（任意）。** 公開モデル API（OpenAI、Anthropic API など）は禁止する [A-7]。業務で OpenAI モデルが必要な場合、LiteLLM は **Japan East の Azure OpenAI Standard デプロイ** を呼び出す。経路は ECS → TGW → Direct Connect → 東京のコロケーション施設のルーター → ExpressRoute プライベート ピアリング → プライベート エンドポイントで、トラフィックは日本国外に出ない（[§8.2](07-private-connectivity.md#82-aws-direct-connect-オーバーレイ)）。このバックエンドにはインターネット経路を使わない。インターネット許可リストにモデルの FQDN を載せることになり、インターネットのルーティングが日本国内に留まる保証もないためである。プロバイダーの API キー、または Entra ワークロード ID の資格情報は **Secrets Manager** から取得する。
 9. **応答と計量。** LiteLLM は応答をストリーミングし、設定されていれば呼び出し後のガードレールを実行する。そのうえで、ユーザー、チーム、キー、タグ、モデル、プロンプト/補完トークン数、コスト、レイテンシを含む **利用額ログ** 行を Aurora に書き込む。予算カウンターは Redis で更新され、非同期で Postgres に永続化される。
-10. **ログとメトリクス。** 以下の保存先はすべて東京にある。コンテナーの標準出力（JSON）は **CloudWatch Logs** に送られる。LiteLLM の Prometheus `/metrics` エンドポイントは **Amazon Managed Prometheus** がスクレイプし、Grafana のダッシュボードで可視化する。LiteLLM の **S3 ログ コールバック** は、[A-10] に従い内容を含まないリクエスト メタデータを S3 ログ バケットに書き込む（[LiteLLM のログ](https://docs.litellm.ai/docs/proxy/logging)）。
+10. **ログとメトリクス。** 以下の保存先はすべて東京にある。コンテナーの標準出力（JSON）は **CloudWatch Logs** に送られる。LiteLLM の Prometheus `/metrics` エンドポイントは **Amazon Managed Prometheus** がスクレイプし、Grafana のダッシュボードで可視化する。LiteLLM の **S3 ログ コールバック** は、リクエスト メタデータを S3 ログ バケットに書き込む（[LiteLLM のログ](https://docs.litellm.ai/docs/proxy/logging)）。内容が含まれないのは `turn_off_message_logging: true` を設定しているからにすぎない（[§2.8](01-common-design.md#28-プロンプトを見られるのは誰か)）。バケットで Object Lock を有効にする前に、V-1 でそれを確認する。
 11. **請求。** Bedrock の利用量は推論プロファイルのタグ付きで **CUR 2.0** に表示される。外部プロバイダーの請求書は別途届く。
 12. **チャージバック。** 日次ジョブで LiteLLM の利用額（チーム、タグ、モデル別）を東京の S3 にエクスポートする。東京の **Athena** と **Quick Sight** で、これを CUR 2.0 エクスポート（これも東京のバケットに配信）と結合し、部門ごとのショーバックを公開する。月末の精算では、実際の請求額を LiteLLM で計測した利用量に比例して配賦する。
 
@@ -177,10 +177,10 @@ flowchart LR
 | 項目 | 設計 |
 |---|---|
 | LiteLLM UI への SSO | Entra **OIDC** アプリ（`litellm-prod`）を LiteLLM の Microsoft SSO 設定（`MICROSOFT_CLIENT_ID`、`MICROSOFT_CLIENT_SECRET`、`MICROSOFT_TENANT`）で使う。クライアント シークレットは Secrets Manager に保管する。使用中の LiteLLM バージョンが対応していれば証明書資格情報を優先し、そうでなければシークレットを 90〜180 日ごとにローテーションする。代替として SAML 2.0 も使える（[LiteLLM SAML](https://docs.litellm.ai/docs/proxy/saml_sso)）。 |
-| API への SSO / 認証 | Entra を発行者とする LiteLLM の **JWT 認証**。Claude Code（`apiKeyHelper`）と Codex CLI（`auth.command`）はトークン コマンドを実行し、OS ブローカー付きの MSAL で `api://litellm-prod/.default` のトークンを取得する（[§2.3.4](01-common-design.md#234-コーディング-エージェントのクライアント)）。`team_ids_jwt_field: groups`（またはアプリ ロール）でトークンを LiteLLM チームに対応付ける（[JWT 認証](https://docs.litellm.ai/docs/proxy/token_auth)）。仮想キーは、貼り付けたキーしか受け付けないツール向けの、有効期限必須の代替手段とする。 |
+| API への認証 | すべての API クライアントに LiteLLM の **仮想キー** を使う（[§2.3](01-common-design.md#23-litellm-api-トラフィックの認証方式)）。ユーザーは SSO で保護された UI で、上限の範囲内で有効期限 30〜90 日の個人用キーを作成する（[§2.3.5](01-common-design.md#235-キーの発行マスター-キー許可リストに載せたワークロード)）。Claude Code（`apiKeyHelper`）と Codex CLI（`auth.command`）は OS のキーチェーンからキーを読む（[§2.3.4](01-common-design.md#234-コーディング-エージェントのクライアント)）。エージェントとアプリは、自身の Secrets Manager に置いたチーム用サービス アカウント キーを使う。LiteLLM の JWT 認証は使わない。 |
 | グループとロールの対応付け | Entra の **アプリ ロール** を LiteLLM のグローバル ロール（`proxy_admin`、`proxy_admin_viewer`、`internal_user`、`internal_user_viewer`）に対応付ける。`llm-team-*` で始まる Entra の **セキュリティ グループ** は、ログイン時のチーム同期で LiteLLM チームに対応付ける（[MSFT SSO チュートリアル](https://docs.litellm.ai/docs/tutorials/msft_sso)）。プロビジョニング解除は **SCIM** で行う（[SCIM](https://docs.litellm.ai/docs/tutorials/scim_litellm)）。トークンには *割り当て済み* のグループだけを含め、200 グループ超過の問題を避ける。 |
-| Intune コンプライアンス | Entra のサインイン時と、トークンの発行・更新のたびに CA-GW-01 で適用する。mTLS を採用する場合は、**すべてのリクエストで** Intune 証明書による ALB mTLS でも適用し、これが仮想キーに対する唯一のデバイス確認になる（[§2.3.2](01-common-design.md#232-ロード-バランサーで-mtls-が確認すること)）。証明書のユーザーはトークンと照合しない（[§2.3.3](01-common-design.md#233-証明書とユーザーの紐付け-採用しない)）。AWS のサービスはエンド ユーザーを検証せず、検証するのは LiteLLM である（[§2.3.1](01-common-design.md#231-リクエストごとに誰が何を検証するか)）。AWS Verified Access は *使わない*。そのデバイス信頼プロバイダーは Jamf、CrowdStrike、JumpCloud であり、Intune ではないためである（[Verified Access のデバイス信頼](https://docs.aws.amazon.com/verified-access/latest/ug/device-trust.html)）。 |
-| サービス間認証 | ECS タスク ロール → Bedrock、Secrets Manager、KMS、S3 を、最小権限ポリシーと VPC エンドポイント ポリシーで構成する。Aurora には **IAM DB 認証** か、ローテーションされる Secrets Manager の資格情報を使う。エージェント → LiteLLM には Entra ワークロード ID の JWT を使う。AWS 上で動くエージェントには、Entra のフェデレーション資格情報と組み合わせた [IAM ロール](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles.html) を使うか、呼び出し元の Secrets Manager に置いたチーム用サービス アカウント仮想キーを使い、mTLS を採用する場合は AWS Private CA 発行の mTLS ワークロード証明書と組み合わせる。 |
+| Intune コンプライアンス | ユーザーが UI にサインインするとき、つまり個人用キーを作成するときに CA-GW-01 で適用する。キーを使うときには再確認しない。[A-16] が成り立つ間は、各リクエストでセキュリティ グループの許可リストがその代わりになる（[§2.3.6](01-common-design.md#236-各認証方式が防ぐ脅威)）。mTLS が必須になった場合は、ALB が **すべてのリクエストで** Intune 証明書も確認する（[§2.3.2](01-common-design.md#232-ロード-バランサーで-mtls-が確認すること)）。証明書のユーザーはキーと照合しない（[§2.3.3](01-common-design.md#233-証明書とユーザーの紐付け-採用しない)）。AWS のサービスはエンド ユーザーを検証せず、検証するのは LiteLLM である（[§2.3.1](01-common-design.md#231-リクエストごとに誰が何を検証するか)）。AWS Verified Access は *使わない*。そのデバイス信頼プロバイダーは Jamf、CrowdStrike、JumpCloud であり、Intune ではないためである（[Verified Access のデバイス信頼](https://docs.aws.amazon.com/verified-access/latest/ug/device-trust.html)）。 |
+| サービス間認証 | ECS タスク ロール → Bedrock、Secrets Manager、KMS、S3 を、最小権限ポリシーと VPC エンドポイント ポリシーで構成する。Aurora には **IAM DB 認証** か、ローテーションされる Secrets Manager の資格情報を使う。エージェント → LiteLLM には、呼び出し元自身の Secrets Manager に置いたチーム用サービス アカウント仮想キーを使う。キーはその [IAM ロール](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles.html) で読み、少なくとも 90 日ごとにローテーションする。mTLS を採用する場合は AWS Private CA 発行の mTLS ワークロード証明書と組み合わせる。AWS 上のエージェントは、`network-prod` の共有送信 NAT を通って経路 B に到達してはならない。その NAT の IP を許可すると、背後のすべてのワークロードを通してしまう（[§2.3.5](01-common-design.md#235-キーの発行マスター-キー許可リストに載せたワークロード)）。専用の送信元 IP か、TGW 経由の内部 ALB（経路 A）を使う。 |
 | 運用者（[§2.9](01-common-design.md#29-アクセス-シナリオとチェックポイント) のシナリオ A2、A3） | IAM Identity Center を Entra と SCIM でフェデレーションする（[ガイド](https://docs.aws.amazon.com/singlesignon/latest/userguide/idp-microsoft-entra.html)）。Entra の Identity Center エンタープライズ アプリには **CA-GW-05** を適用する（フィッシング耐性のある MFA、準拠デバイス、オフィス/DC のネームド ロケーション、デバイス コード フローのブロック）。管理者用権限セットの **セッション時間は 1 時間** とする（上限は 12 時間）。SCP または権限セットのポリシーで、`aws:SourceIp` がオフィスや DC の送信元 IP でない呼び出しを拒否する。運用者の代わりに AWS のサービスが行う呼び出しが動くよう、`aws:ViaAWSService` の例外を設ける。AWS CLI は `aws sso login` でサインインし、同じマシンのブラウザーを使う。サインインしたマシンとは別のマシンに資格情報が渡る `--use-device-code` は使わない。緊急用（break-glass）の IAM ユーザーは金庫で保管する。Fargate タスクへの対話型アクセスは行わず、本番環境では ECS Exec を無効にする。 |
 
 ## 4.5 コスト配賦とトークン制御（AWS）
@@ -194,6 +194,14 @@ flowchart LR
 | アラート | LiteLLM の予算アラート（Slack/メールの Webhook）、`remaining_budget` に対する Prometheus アラート | ゲートウェイ アカウントと `CostCenter` タグごとに 80/100% のしきい値で **AWS Budgets** を設定し、SNS で通知する |
 | レポート | LiteLLM UI の使用状況タブ、`/spend/*` API | CUR 2.0 → Athena → Quick Sight。`team_id`/タグと日付で LiteLLM の利用額エクスポートと結合する |
 
+**2 つの情報源の組み合わせ方。** ルールがなければ両者は食い違い、どちらの数字が正しいのか誰にも分からなくなる。
+
+- **合計は CUR、配分比は LiteLLM。** 各チームへの請求額は、モデル サービスの CUR 合計に、LiteLLM が記録した **コスト**（トークン数ではない。キャッシュありとなしのトークンは価格が異なるため）に占めるそのチームの割合を掛けたものとする。
+- **差額は配分せずに報告する。** CUR 合計から LiteLLM の利用額の合計を引いた差額を、毎月独立した行として示す。そこには価格表の誤り（V-4）、キャンセルされたリクエスト（V-5）、LiteLLM が記録しなかったリクエストが含まれる。使用量に比例して各チームに配分すると、差額を生んだチームが本来の負担より少なく払うことになる。合意した閾値を超えたら調査する。
+- **タグ付き推論プロファイルは突き合わせに使う。** チーム専用のプロファイルがある場合は、その CUR タグ合計と LiteLLM の利用額を比較する。ルーティングでそのチームのリクエストが別のプロファイルに送られると両者は食い違う。LiteLLM は同じモデル名を共有するすべてのデプロイメントに負荷分散するので（[負荷分散](https://docs.litellm.ai/docs/proxy/load_balancing)）、チーム専用のプロファイルにはチーム専用のモデル名が必要であり、タグのない `jp.` プロファイルへのフォールバックは CUR ではタグなしの利用額として現れる。
+- **固定費の構成要素** は、VPC 内のガードレール サービス、SageMaker エンドポイント、使う場合は専用線の負担分（[§8.9](07-private-connectivity.md#89-閉域接続のコスト日本)）である。使用量にかかわらず費用は同じで、LiteLLM がこれらについて何を記録するかは V-4 で分かる。公開した配賦基準でプラットフォームの間接費として配分するか、LiteLLM で独自の価格を設定するかを、ローンチ前に決める。
+- **予算期間:** `budget_duration: 30d` はローリング期間だが、チャージバックは暦月単位である。両者は一致しないものと考える。
+
 ## 4.6 ネットワーク（AWS）
 
 - **アカウントと VPC:** `network-prod` アカウントが Transit Gateway、DX Gateway、検査/送信用 VPC を所有する。`llm-gateway-prod` アカウントには、3 AZ にまたがる VPC `10.60.0.0/20` を 1 つ置く。
@@ -202,7 +210,7 @@ flowchart LR
   - `data`（/26 ×3）: Aurora と ElastiCache。
   - `endpoints`（/26 ×3）: `bedrock-runtime`、`bedrock`、`bedrock-agent-runtime`（使う場合）、`sagemaker.runtime`、`secretsmanager`、`kms`、`logs`、`monitoring`、`sts`、`ecr.api`、`ecr.dkr`、`elasticloadbalancing` のインターフェイス エンドポイントと、**S3 ゲートウェイ エンドポイント**。エンドポイントではプライベート DNS を有効にする。オンプレミスの DNS からは Route 53 Resolver の受信エンドポイントで名前解決できるようにする（[Resolver](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/resolver.html)）。
 - **セキュリティ グループ:** ALB の SG はオフィスと DC の送信元 CIDR [A-14] からの 443 だけを許可し、`0.0.0.0/0` は決して許可しない（EKS サンプルの `allowlist-explicit` モード）。WAF の IP セットにも同じリストを登録する。経路 A を追加する場合、その内部 ALB の SG は TGW 経由で届く社内のアドレス範囲を許可する。タスクの SG は ALB の SG からの 4000 のみ許可する。データの SG はタスクの SG からの 5432/6379 のみ許可する。エンドポイントの SG はタスクの SG からの 443 を許可する。
-- **送信:** アプリ サブネットから IGW へのルートは置かない。デフォルト ルートは TGW 経由で **検査用 VPC** に向け、**Network Firewall** のステートフル ルールで TLS SNI を許可リスト化する。対象は `login.microsoftonline.com`、`graph.microsoft.com`、必要なら LiteLLM のライセンス エンドポイント（[§2.5](01-common-design.md#25-日本国内データ所在全設計に適用)）、そして LiteLLM が Okta を呼び出す場合に限り `*.okta.com`（通常は呼び出さない）である。**インターネット許可リストにはモデル プロバイダーの FQDN を一切載せない** [A-7]。日本リージョンの Azure OpenAI バックエンドには閉域経路で接続する。それ以外はすべて拒否してログに記録するので、日本国外のエンドポイントへの接続の試みも検知できる。
+- **送信:** アプリ サブネットから IGW へのルートは置かない。デフォルト ルートは TGW 経由で **検査用 VPC** に向け、**Network Firewall** のステートフル ルールで TLS SNI を許可リスト化する。対象は `login.microsoftonline.com`、`graph.microsoft.com`、必要なら LiteLLM のライセンス エンドポイント（[§2.5](01-common-design.md#25-日本国内データ所在全設計に適用)）、そして LiteLLM が Okta を呼び出す場合に限り `*.okta.com`（通常は呼び出さない）である。**インターネット許可リストにはモデル プロバイダーの FQDN を一切載せない** [A-7]。日本リージョンの Azure OpenAI バックエンドには閉域経路で接続する。それ以外はすべて拒否してログに記録するので、日本国外のエンドポイントへの接続の試みも検知できる。**FQDN 許可リストの限界:** `login.microsoftonline.com` と `graph.microsoft.com` は当社だけでなくすべての Entra テナントに対応する。タスクで動くコードが別のテナントにサインインし、許可された名前を通じてデータを送ることもできるので、許可リストが防ぐのは偶発的な送信であり、侵害されたタスクではない。ネットワーク チームと 2 点を確認する。許可された SNI を持ちながら無関係な IP アドレスへ向かう TLS 接続がブロックされるか（タスクからテストする）、そしてこの送信経路に Entra のテナント制限を適用できるかである。
 - **受信経路:** (a) **経路 B（主経路）:** インターネット → リージョン WAF → インターネット向け ALB（オフィス/DC の IP のみ）。mTLS は採用する場合に適用する。サイト間 VPN は不要。(b) **経路 A（任意、[§8.2](07-private-connectivity.md#82-aws-direct-connect-オーバーレイ)）:** Direct Connect → TGW → 同じ ECS サービスの前に置く 2 つ目の *内部* ALB。サンプルの `internal` モードに当たる。経路はスプリット ホライズン DNS で選ぶ。ALB の IP アドレスは時間とともに変わるため、オフィスのファイアウォールが固定の宛先 IP しか許可できない場合は、ALB の前に AWS Global Accelerator を置くか経路 A を使う（[§2.6](01-common-design.md#26-接続経路モデル全設計に適用)）。
 
 ## 4.7 データとログ（AWS）
@@ -210,18 +218,18 @@ flowchart LR
 | データ | 保存先 | 保護 | 保持期間（案） |
 |---|---|---|---|
 | LiteLLM 設定 DB（ユーザー、チーム、ハッシュ化したキー、予算） | 東京の Aurora PostgreSQL、マルチ AZ、CMK で暗号化、PITR 有効 | SG による分離、IAM 認証、TLS 必須（`rds.force_ssl`） | プラットフォームの存続期間。PITR 35 日。日次スナップショットは大阪にのみコピー |
-| 利用額ログ（リクエストごと） | Aurora（`LiteLLM_SpendLogs`）。大量の場合は別 DB またはパーティショニング（[LiteLLM 本番ガイド](https://docs.litellm.ai/docs/proxy/prod)） | 同上 | Postgres で 90 日間ホット保持。日次で S3 に Parquet でエクスポートし、財務用に 7 年保持 [前提] |
-| レート制限カウンターとキャッシュ | ElastiCache Valkey/Redis、マルチ AZ、転送時・保存時の暗号化、AUTH/RBAC | SG による分離 | 一時的 |
-| リクエスト メタデータ ログ | 東京の S3（LiteLLM の S3 コールバック）→ Athena | SSE-KMS、VPC エンドポイントに限定したバケット ポリシー、Object Lock（ガバナンス） | 1 年ホット、その後 7 年まで Glacier |
-| プロンプト/応答の内容（オプトインしたチームのみ） | Bedrock モデル呼び出しログ → 東京の専用 S3 バケット、またはチーム単位のフラグ付き LiteLLM コールバック | 専用の KMS キーとアクセス ロール、Macie によるスキャン | 各チームの法的要件による（既定 30 日） |
+| 利用額ログ（リクエストごと） | Aurora（`LiteLLM_SpendLogs`）。1 リクエスト 1 行。[A-9] の規模では 1 日 430 万〜1,700 万行（50〜200 RPS）、90 日で 4 億〜16 億行になり、キーとチームの照合を担うのと同じデータベースに入る。**未決:** このテーブルが認証を遅くしないようにする方法（例: パーティショニング、ホット期間の短縮、別の保存先）をローンチ前に決める。現行の LiteLLM 本番ガイドには利用額ログ用の別データベースの記載がないので、固定したバージョンが何をサポートするか確認する。 | 同上 | Postgres で 90 日間ホット保持。日次で S3 に Parquet でエクスポートし、財務用に 7 年保持 [前提]。古い行を削除する前にエクスポートが成功していなければならない。 |
+| レート制限カウンター | ElastiCache Valkey/Redis、マルチ AZ、転送時・保存時の暗号化、AUTH/RBAC。応答キャッシュは使わない。 | SG による分離 | 一時的 |
+| リクエスト メタデータ ログ | 東京の S3（LiteLLM の S3 コールバック、`turn_off_message_logging: true`）→ Athena | SSE-KMS、VPC エンドポイントに限定したバケット ポリシー、Object Lock（ガバナンス）。誤って書き込まれた内容を削除できるよう、Object Lock は V-1 の合格 **後に** 有効にする（[§2.10](01-common-design.md#210-ローンチ-ゲート-本番前に検証する)） | 1 年ホット、その後 7 年まで Glacier。ユーザー単位のメタデータは個人データなので、保持期間をプライバシー部門と確認する（[§2.8](01-common-design.md#28-プロンプトを見られるのは誰か)）。 |
+| プロンプト/応答の内容（オプトインしたチームのみ） | **未決**（[§2.8](01-common-design.md#28-プロンプトを見られるのは誰か)）。Bedrock のモデル呼び出しログは使わない。アカウントとリージョン内のすべての呼び出しが対象になるため、この共有アカウントではすべてのチームを記録してしまう（[呼び出しログ](https://docs.aws.amazon.com/bedrock/latest/userguide/model-invocation-logging.html)）。無効のままにする。 | 専用の KMS キーとアクセス ロール、Macie によるスキャン | 各チームの法的要件による（既定 30 日） |
 | 管理監査（誰がキーや予算を変更したか） | LiteLLM 監査ログ（エンタープライズ）→ S3、CloudTrail 組織証跡（ホーム リージョンは東京） | ログ アーカイブ アカウントの不変バケット | 7 年 |
 | インフラのログ | 東京の CloudWatch Logs（ALB アクセス ログ、WAF ログ、Network Firewall のフロー/アラート ログ、VPC フロー ログ） | KMS、SIEM へのクロスアカウント サブスクリプション（SIEM の保存先も日本国内にする） | CloudWatch で 90 日、S3 で 1〜7 年 |
 
 ## 4.8 セキュリティ制御（AWS）
 
-- **WAF:** オフィス/DC の IP セット、送信元 IP ごとのレートベース ルール、Amazon IP レピュテーション、Known Bad Inputs、そして API パスでは `SizeRestrictions_BODY` を Count に上書きした Core ルール セット。このルールは 8 KB を超える本文をすべて遮断し、これはほぼすべてのコーディング エージェントのリクエストにあたる。本文の XSS/LFI/RFI ルールもコードでの誤検知を確認する（[§2.7](01-common-design.md#27-llm-トラフィック向けの-waf-調整とタイムアウト)）。ALB 上の AWS WAF は本文の先頭 8 KB しか検査しないため、本文全体のサイズは強制できない。それは LiteLLM のリクエスト サイズ制限で行う。`/ui`、`/sso`、`/key/*` の管理パスには、より厳格な別ルール セットを適用する。WAF ログでは `authorization` と `x-api-key` を秘匿する（[§2.8](01-common-design.md#28-プロンプトを見られるのは誰か)）。
-- **mTLS（推奨オプション。[§2.3.2](01-common-design.md#232-ロード-バランサーで-mtls-が確認すること) の場合は必須）:** ALB の [相互認証の検証モード](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/mutual-authentication.html)。トラスト ストアには Intune の発行 CA と AWS Private CA を含める。定期ジョブで最新の CRL を S3 に公開し、トラスト ストアの失効リストを更新する。証明書の有効期間は 30〜90 日で自動更新する。Intune 証明書プロファイルで、秘密鍵を TPM または Secure Enclave にエクスポート不可として保持する。
-- **シークレット:** Secrets Manager で DB 資格情報を自動ローテーションする。プロバイダー キーは、プロバイダー別のローテーション Lambda または手動の手順書で 90 日ごとにローテーションする。LiteLLM の `LITELLM_MASTER_KEY` と `LITELLM_SALT_KEY` は ECS のシークレットとしてのみ注入する。**ソルト キーは保存済みのプロバイダー資格情報の暗号化に使われるため、再暗号化の計画なしにローテーションしてはならない。**
+- **WAF:** オフィス/DC の IP セット、オフィスのピークを上回る洪水対策の上限として設定した送信元 IP ごとのレートベース ルール（[§2.7](01-common-design.md#27-llm-トラフィック向けの-waf-調整とタイムアウト)）、Amazon IP レピュテーション、Known Bad Inputs、そして API パスでは `SizeRestrictions_BODY` を Count に上書きした Core ルール セット。このルールは 8 KB を超える本文をすべて遮断し、これはほぼすべてのコーディング エージェントのリクエストにあたる。本文の XSS/LFI/RFI ルールもコードでの誤検知を確認する（[§2.7](01-common-design.md#27-llm-トラフィック向けの-waf-調整とタイムアウト)）。ALB 上の AWS WAF は本文の先頭 8 KB しか検査しないため、本文全体のサイズは強制できない。それは LiteLLM のリクエスト サイズ制限で行う。`/ui`、`/sso`、`/key/*` の管理パスには、より厳格な別ルール セットを適用する。WAF ログでは `authorization` と `x-api-key` を秘匿する（[§2.8](01-common-design.md#28-プロンプトを見られるのは誰か)）。
+- **mTLS（既定では構築しない。[§2.3.2](01-common-design.md#232-ロード-バランサーで-mtls-が確認すること) の場合だけ必須）:** ALB の [相互認証の検証モード](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/mutual-authentication.html)。トラスト ストアには Intune の発行 CA と AWS Private CA を含める。Intune 証明書プロファイルで、秘密鍵を TPM または Secure Enclave にエクスポート不可として保持する。定期ジョブで最新の CRL を S3 に公開し、トラスト ストアの失効リストを更新する。証明書の有効期間は 30〜90 日で自動更新する。
+- **シークレット:** Secrets Manager で DB 資格情報を自動ローテーションする。プロバイダー キーは、プロバイダー別のローテーション Lambda または手動の手順書で 90 日ごとにローテーションする。LiteLLM の `LITELLM_MASTER_KEY` と `LITELLM_SALT_KEY` は ECS のシークレットとしてのみ注入する。マスター キーは [§2.3.5](01-common-design.md#235-キーの発行マスター-キー許可リストに載せたワークロード) のとおりに扱う。人が日常的に使わず、新しい値の設定と再起動でローテーションし、それに対する `secretsmanager:GetSecretValue` を持つプリンシパルはすべてプロキシ管理者として見直す。**ソルト キーは保存済みのプロバイダー資格情報の暗号化に使われるため、再暗号化の計画なしにローテーションしてはならない。**
 - **暗号化:** すべての通信で TLS 1.2 以上（ALB のセキュリティ ポリシー `ELBSecurityPolicy-TLS13-1-2-2021-06`）。Aurora、ElastiCache、S3、CloudWatch Logs、Secrets Manager は KMS CMK で暗号化する。
 - **ガードレール / PII:** すべてのモデルについて、VPC 内ガードレール サービスを呼び出し前後の既定ガードレールとする。PII には Presidio、プロンプト攻撃とコンテンツには日本語対応の分類器を使う。AWS が日本国内に閉じるガードレール プロファイル、または Classic 階層の日本語対応を提供した時点で、Bedrock Guardrails を再評価する。LiteLLM のガードレールはチームまたはキー単位で設定する。
 - **所在要件のガードレール:** SCP で東京と大阪以外のリージョンをすべて拒否し（グローバル サービスは除く）、`global.*` と `apac.*` 推論プロファイルに対する `bedrock:InvokeModel*` を拒否する。AWS Config ルールで 2 リージョン以外のリソースを検出する。新しい Bedrock モデルは、`GetInferenceProfile` で送信先が東京と大阪であることを確認してから導入する。
@@ -230,11 +238,15 @@ flowchart LR
 
 ## 4.9 スケーラビリティと HA（AWS）
 
-- **コンピューティング:** ECS Fargate サービスで 3 AZ に最低 3 タスクを分散する。CPU（約 60%）と ALB の `RequestCountPerTarget` によるターゲット追跡の自動スケーリングを使う。Uvicorn のワーカー数は vCPU 数に合わせる。ALB のアイドル タイムアウトと LiteLLM の `request_timeout` はどちらも 600 秒にする（[§2.7](01-common-design.md#27-llm-トラフィック向けの-waf-調整とタイムアウト)）。
+- **コンピューティング:** ECS Fargate サービスで 3 AZ に最低 3 タスクを分散する。CPU（約 60%）と ALB の `RequestCountPerTarget` によるターゲット追跡の自動スケーリングを使う。Uvicorn のワーカー数は vCPU 数に合わせる。ALB のアイドル タイムアウトは 600 秒、LiteLLM の `request_timeout` はそれより短く（例: 570 秒）、ターゲット グループの登録解除の遅延は 600 秒以上にして、デプロイやスケールインで実行中のストリームを切らずにドレインする（[§2.7](01-common-design.md#27-llm-トラフィック向けの-waf-調整とタイムアウト)）。その結果、ローリング デプロイは 1 バッチあたり最大 10 分かかる。
 - **代替:** プラットフォーム チームがすでに EKS を運用している場合や、サンプルの L4 クロスアカウント アクセスが必要な場合は EKS（サンプルの既定。Pod Identity、HPA、PodDisruptionBudget）。サンプルはどちらにも対応するが、1 回のデプロイで両方は使えない。
-- **データ層:** UI と分析用のリーダーを持つ Aurora マルチ AZ。自動フェイルオーバー付きの ElastiCache マルチ AZ。
+- **データ層:** UI と分析用のリーダーを持つ Aurora マルチ AZ。自動フェイルオーバー付きの ElastiCache マルチ AZ。Aurora のフェイルオーバー中に呼び出し元から何が見えるかは、推測せずに V-8 で測定する（[§2.10](01-common-design.md#210-ローンチ-ゲート-本番前に検証する)）。
+- **共有の依存先:** UI へのサインインとチーム同期には Entra（トークン交換、署名鍵、Graph）が必要で、LiteLLM は別チームが所有する `network-prod` の Network Firewall の送信経路を通じてそこに到達する。仮想キーによる API リクエストはこの経路に依存しないので、送信経路の障害で止まるのはサインインとキーの作成であり、モデルのトラフィックではない。V-10 でこれを確認する。この経路のルールとルートの変更は、ゲートウェイの変更プロセスに従う。
 - **モデル容量:** `jp.` プロファイルが東京と大阪に負荷を分散する。残りは LiteLLM ルーターの **フォールバック** で処理するが、フォールバック先は日本国内で処理される他のデプロイに限る（例: Claude Opus 5.5 `jp.` → Claude Opus 4.8 `jp.`、または Azure OpenAI Japan East）。429/5xx 時には `cooldown` を使う。`global.` プロファイルや公開 API には決してフォールバックしない。
-- **DR:** 同じ IaC からデプロイする **大阪** のウォーム スタンバイ。`jp.` プロファイルは大阪を送信元リージョンとして呼び出せるため、東京の障害時もモデル層は動き続ける。Aurora Global Database 東京 → 大阪（RPO 約 1 秒）と Route 53 のフェイルオーバー レコードを使う。大阪の ALB にも同じセキュリティ グループの許可リストと WAF ルールが必要であり、mTLS を採用する場合は同じトラスト ストアと CRL ジョブも必要である。Redis はコールドで再構築するため、レート制限カウンターは一時的にリセットされるが、予算は Postgres に残る。RTO は 30〜60 分。
+- **DR:** 同じ IaC からデプロイする **大阪** のウォーム スタンバイ。`jp.` プロファイルは大阪を送信元リージョンとして呼び出せるため、東京の障害時もモデル層は動き続ける。Aurora Global Database 東京 → 大阪（RPO 約 1 秒）と Route 53 のフェイルオーバー レコードを使う。大阪の ALB にも同じセキュリティ グループの許可リストと WAF ルールが必要であり、mTLS を採用する場合は同じトラスト ストアと CRL ジョブも必要である。Redis はコールドで再構築するため、レート制限カウンターは一時的にリセットされる。予算は Postgres に残るが、Redis にあってまだ永続化されていない利用額は失われる（[§4.3](#43-リクエスト-フローの説明aws) のステップ 9）。RTO は 30〜60 分。フェイルオーバーを試験する前に解消すべき DR の不備:
+  - **ヘルス チェック。** Route 53 のヘルス チェッカーは `ROUTE53_HEALTHCHECKS` の範囲から接続するので、ファイアウォールやセキュリティ グループでそれを許可しなければならない（[Route 53 の IP 範囲](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/route-53-ip-addresses.html)）。ALB はオフィスと DC の IP だけを許可するので、ALB に対するヘルス チェックは失敗する。ヘルス パスに限ってその範囲を許可するか、CloudWatch アラームに基づいてフェイルオーバーする。
+  - **大阪の送信経路。** 大阪のゲートウェイには、Entra（UI へのサインインとチーム同期用）とライセンス エンドポイントへの独自の経路が必要である。`network-prod` の送信用 VPC は東京にあるので、大阪用にこの経路を設計しなければならない。
+  - **東京で In-Region として使うモデル**（[§2.5](01-common-design.md#25-日本国内データ所在全設計に適用) のスナップショットにある埋め込み、Mistral Large 3、gpt-oss-120b）。それぞれ大阪にあるかを確認する。なければ DR はなく、埋め込みモデルは再インデックスなしに別のモデルへ切り替えられない。
 
 
 ---
