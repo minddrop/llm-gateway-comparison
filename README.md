@@ -1,10 +1,10 @@
 # LLM Gateway Architecture Comparison for Japan (AWS / Azure / GCP)
 
-Architecture documentation for an internal **LiteLLM**-based LLM gateway platform covering user and team management, cost allocation, and token controls. It is designed for our existing environment: Microsoft Entra ID for identity, Okta Verify for MFA, Intune for device trust, and the existing ExpressRoute / Direct Connect / Cloud Interconnect links as an optional private route. Users are engineers on the corporate network; the primary route is the internet with an office IP allowlist and Entra ID, plus mTLS with Intune certificates as a recommended option. **All inference, gateway processing, logs, and data pipelines stay in Japan** (Tokyo primary, Osaka DR).
+Architecture documentation for an internal **LiteLLM**-based LLM gateway platform covering user and team management, cost allocation, and token controls. It is designed for our existing environment: Microsoft Entra ID for identity, Okta Verify for MFA, Intune for device trust, and the existing ExpressRoute / Direct Connect / Cloud Interconnect links as an optional private route. Users are engineers on the corporate network; the primary route is the internet with an office IP allowlist. API clients use LiteLLM virtual keys, which users create after signing in with Entra ID; mTLS with Intune certificates is added only if unmanaged devices can use the office egress IPs. **All inference, gateway processing, logs, and data pipelines stay in Japan** (Tokyo primary, Osaka DR).
 
 The English version is authoritative. The Japanese translation (`docs/jp/`) uses the same filenames as the English version (`docs/en/`).
 
-LiteLLM を基盤とする社内 LLM ゲートウェイのアーキテクチャ ドキュメント。利用者は社内ネットワーク上のエンジニアで、主経路はインターネット（オフィス IP 許可リスト + Entra ID、推奨オプションとして Intune 証明書による mTLS）、専用線は任意の閉域経路とする。推論、ゲートウェイ処理、ログ、データ パイプラインはすべて日本国内（東京をプライマリ、大阪を DR）に閉じる。英語版を正とし、日本語訳（`docs/jp/`）は英語版（`docs/en/`）と同じファイル名で対応している。
+LiteLLM を基盤とする社内 LLM ゲートウェイのアーキテクチャ ドキュメント。利用者は社内ネットワーク上のエンジニアで、主経路はインターネット（オフィス IP 許可リスト + LiteLLM 仮想キー。キーは Entra ID でサインインして作成し、Intune 証明書による mTLS は非管理端末がオフィスの送信元 IP を使える場合にのみ追加）、専用線は任意の閉域経路とする。推論、ゲートウェイ処理、ログ、データ パイプラインはすべて日本国内（東京をプライマリ、大阪を DR）に閉じる。英語版を正とし、日本語訳（`docs/jp/`）は英語版（`docs/en/`）と同じファイル名で対応している。
 
 | # | English | 日本語 |
 |---|---|---|
